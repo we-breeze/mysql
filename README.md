@@ -1,4 +1,32 @@
-# mysql
+# brz-mysql
+
+`brz-mysql` owns bounded MySQL reader/writer pools for Breeze services. Product
+code keeps SQL and row mapping, while this crate owns pool construction,
+recording-compatible session options, role selection and connection-acquisition
+budgets.
+
+## Development
+
+```bash
+cargo fmt --all --check
+cargo test --workspace --all-features
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+```
+
+Real MySQL integration tests are feature-gated and use MySQL 5.7.18:
+
+```bash
+./breeze/mysql/scripts/integration-test.sh
+```
+
+The Docker benchmark is intended for repeatable functional comparison. Use the
+local script with a dedicated native MySQL instance for trustworthy performance
+numbers:
+
+```bash
+./breeze/mysql/tools/mysql-bench/bench.sh --ops 100000 --concurrency 64
+MYSQL_URL=mysql://... ./breeze/mysql/tools/mysql-bench/bench_local.sh
+```
 
 
 

@@ -6,3 +6,8 @@ description = "Breeze platform MySQL access capability: owns the raw sqlx driver
 
 [dependencies]
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "mysql", "chrono"] }
+thiserror = "2"
+tokio = { version = "1", features = ["macros"] }
+
+[features]
+integration-tests = []
