@@ -1,120 +1,184 @@
 # brz-mysql
 
-`brz-mysql` owns bounded MySQL reader/writer pools for Breeze services. Product
-code keeps SQL and row mapping, while this crate owns pool construction,
-recording-compatible session options, role selection and connection-acquisition
-budgets.
+brz-mysql exposes an application-facing MySQL contract and keeps SQLx as its
+private wire-protocol and connection-pool driver. Repositories provide SQL,
+typed arguments, and result structs; they do not handle SQLx rows, transaction
+completion, or physical table names.
+
+The first version matches Wegent's current topology: one read/write pool with
+optional table selection. Reader/writer pools and database routing can be added
+inside MysqlService without changing repository queries.
+
+## Typed queries
+
+```rust
+use brz_mysql::{FromMysqlRow, Json, MysqlService};
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Deserialize, Serialize)]
+struct TaskConfig {
+    retryable: bool,
+}
+
+#[derive(Debug, FromMysqlRow)]
+struct Task {
+    id: u64,
+    title: String,
+    config: Json<TaskConfig>,
+    deleted_at: Option<chrono::NaiveDateTime>,
+}
+
+let mysql = MysqlService::connect(database_url).await?;
+
+let task: Task = mysql
+    .fetch_one(
+        "SELECT id, title, config, deleted_at FROM tasks WHERE id = ?",
+        (task_id,),
+    )
+    .await?;
+
+mysql
+    .execute(
+        "UPDATE tasks SET title = ? WHERE id = ?",
+        ("new title", task_id),
+    )
+    .await?;
+# Ok::<(), brz_mysql::MysqlError>(())
+```
+
+Arguments are heterogeneous tuples. Implementations exist for tuples up to 16
+items, homogeneous arrays and vectors, primitive numeric values, strings,
+bytes, dates and times, Option<T>, decimal values, and Json<T>. An application
+newtype can implement MysqlValue by forwarding to MysqlValueWriter::push.
+
+FromMysqlRow is a derive macro for named structs. Use
+#[mysql(rename = "column_name")] when a field and column differ. Json<T>
+serializes directly into SQLx's MySQL argument buffer and deserializes directly
+from a JSON column.
+
+## Transactions
+
+```rust
+let task: Task = mysql
+    .with_transaction(async |transaction| {
+        transaction
+            .execute(
+                "UPDATE tasks SET title = ? WHERE id = ?",
+                ("new title", task_id),
+            )
+            .await?;
+
+        transaction
+            .fetch_one(
+                "SELECT id, title, config, deleted_at FROM tasks WHERE id = ?",
+                (task_id,),
+            )
+            .await
+    })
+    .await?;
+# Ok::<(), brz_mysql::MysqlError>(())
+```
+
+The public Mysql contract does not expose begin, commit, or rollback. Returning
+Ok from the closure commits; returning Err rolls back. Cancellation or panic
+drops the private SQLx transaction, which schedules rollback.
+
+## Streaming
+
+fetch is the primary large-result API. It is lazy and decodes one row at a
+time. fetch_all is an explicit convenience that collects the same output into
+Vec<T>. A polled stream owns one pooled connection until it completes or is
+dropped; creating a stream without polling it does not acquire a connection.
+
+```rust
+use futures_util::{StreamExt, pin_mut};
+
+let tasks = mysql.fetch::<_, _, Task>(
+    "SELECT id, title, config, deleted_at FROM tasks WHERE id >= ? ORDER BY id",
+    (first_id,),
+);
+pin_mut!(tasks);
+
+while let Some(task) = tasks.next().await {
+    consume(task?);
+}
+# Ok::<(), brz_mysql::MysqlError>(())
+```
+
+The public stream is returned as impl Stream rather than Box<dyn Stream>, so
+the brz-mysql abstraction does not add a stream boxing allocation.
+
+## Table selection
+
+A table-sharded MysqlService is constructed with a selector. Every query sent
+through that service must contain a configured logical-table token, and its
+first SQL argument must be the table-selection value.
+
+```rust
+use brz_mysql::{
+    MysqlSelectorValue, MysqlService, MysqlServiceOptions, MysqlTableSelection,
+    MysqlTableSharding,
+};
+
+let sharding = MysqlTableSharding::new(
+    16,
+    ["tasks", "subtasks"],
+    |first: MysqlSelectorValue<'_>| {
+        Ok(MysqlTableSelection::Shard((first.as_u64()? % 16) as u32))
+    },
+)?;
+
+let mysql = MysqlService::connect_with_options(
+    database_url,
+    MysqlServiceOptions::default().with_table_sharding(sharding),
+)
+.await?;
+
+let task: Task = mysql
+    .fetch_one(
+        "SELECT id, title, config, deleted_at          FROM {{tasks}} WHERE owner_user_id = ? AND id = ?",
+        (owner_user_id, task_id),
+    )
+    .await?;
+# Ok::<(), brz_mysql::MysqlError>(())
+```
+
+The selector can return Base for a legacy table or Shard(index). Physical names
+are precomputed when the service configuration is built. The first argument is
+still encoded normally as the first SQL placeholder; there is no separate
+routing parameter and no all-partition fanout API.
+
+## Allocation boundary
+
+MysqlArgs reserves and writes values directly into SQLx's final MySQL argument
+buffer. It does not first build Vec<MysqlValue>. MysqlRow wraps the driver row
+and decodes only requested fields, without copying the row into an intermediate
+map.
+
+The shared Breeze EphemeralBytesArena is intentionally not used here. Redis
+owns its full wire-frame encoding, so an arena allocation can be the final
+socket-write storage. SQLx owns MySqlArguments as an internal Vec<u8>; placing
+an arena in front of it would add an extra copy. If Breeze later owns the MySQL
+wire transport, the arena belongs at that protocol-frame boundary.
 
 ## Development
 
 ```bash
 cargo fmt --all --check
-cargo test --workspace --all-features
+cargo test --workspace --all-targets --all-features
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
-Real MySQL integration tests are feature-gated and use MySQL 5.7.18:
+Real integration tests use MySQL 5.7.18:
 
 ```bash
-./breeze/mysql/scripts/integration-test.sh
+./scripts/integration-test.sh
 ```
 
-The Docker benchmark is intended for repeatable functional comparison. Use the
-local script with a dedicated native MySQL instance for trustworthy performance
-numbers:
+The included benchmark is intended for functional comparison. Use a dedicated
+native MySQL instance for trustworthy measurements:
 
 ```bash
-./breeze/mysql/tools/mysql-bench/bench.sh --ops 100000 --concurrency 64
-MYSQL_URL=mysql://... ./breeze/mysql/tools/mysql-bench/bench_local.sh
+./tools/mysql-bench/bench.sh --ops 100000 --concurrency 64
+MYSQL_URL=mysql://... ./tools/mysql-bench/bench_local.sh
 ```
-
-
-
-## Getting started
-
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
-
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
-
-## Add your files
-
-- [ ] [Create](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#create-a-file) or [upload](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#upload-a-file) files
-- [ ] [Add files using the command line](https://docs.gitlab.com/ee/gitlab-basics/add-file.html#add-a-file-using-the-command-line) or push an existing Git repository with the following command:
-
-```
-cd existing_repo
-git remote add origin https://git.intra.example.com/platform/breeze/mysql.git
-git branch -M master
-git push -uf origin master
-```
-
-## Integrate with your tools
-
-- [ ] [Set up project integrations](https://git.intra.example.com/platform/breeze/mysql/-/settings/integrations)
-
-## Collaborate with your team
-
-- [ ] [Invite team members and collaborators](https://docs.gitlab.com/ee/user/project/members/)
-- [ ] [Create a new merge request](https://docs.gitlab.com/ee/user/project/merge_requests/creating_merge_requests.html)
-- [ ] [Automatically close issues from merge requests](https://docs.gitlab.com/ee/user/project/issues/managing_issues.html#closing-issues-automatically)
-- [ ] [Enable merge request approvals](https://docs.gitlab.com/ee/user/project/merge_requests/approvals/)
-- [ ] [Set auto-merge](https://docs.gitlab.com/ee/user/project/merge_requests/merge_when_pipeline_succeeds.html)
-
-## Test and Deploy
-
-Use the built-in continuous integration in GitLab.
-
-- [ ] [Get started with GitLab CI/CD](https://docs.gitlab.com/ee/ci/quick_start/index.html)
-- [ ] [Analyze your code for known vulnerabilities with Static Application Security Testing(SAST)](https://docs.gitlab.com/ee/user/application_security/sast/)
-- [ ] [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/ee/topics/autodevops/requirements.html)
-- [ ] [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/ee/user/clusters/agent/)
-- [ ] [Set up protected environments](https://docs.gitlab.com/ee/ci/environments/protected_environments.html)
-
-***
-
-# Editing this README
-
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thank you to [makeareadme.com](https://www.makeareadme.com/) for this template.
-
-## Suggestions for a good README
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
-
-## Name
-Choose a self-explaining name for your project.
-
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
-
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
-
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
-
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
-
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
-
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
-
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
-
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
-
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
-
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
-
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
-
-## License
-For open source projects, say how it is licensed.
-
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
