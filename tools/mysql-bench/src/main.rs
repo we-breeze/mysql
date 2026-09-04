@@ -1,4 +1,4 @@
-use brz_mysql::{MySqlPoolConfig, MySqlResource, MySqlResourceConfig};
+use brz_mysql::{FromMysqlRow, MysqlService, MysqlServiceOptions};
 use std::{
     env,
     sync::Arc,
@@ -6,40 +6,42 @@ use std::{
 };
 use tokio::sync::Semaphore;
 
+#[derive(FromMysqlRow)]
+struct One {
+    one: i32,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let url = required("--url")?;
     let operations = parsed("--ops", 100_000_usize)?;
     let concurrency = parsed("--concurrency", 64_usize)?;
     let max_connections = parsed("--connections", 16_u32)?;
-    let pool = MySqlPoolConfig {
-        url,
+    let options = MysqlServiceOptions {
         max_connections,
+        min_connections: 0,
         acquire_timeout: Duration::from_secs(5),
-        idle_timeout: Duration::from_secs(60),
-        max_lifetime: Duration::from_secs(300),
+        idle_timeout: Some(Duration::from_secs(60)),
+        max_lifetime: Some(Duration::from_secs(300)),
         slow_acquire_threshold: Duration::from_millis(500),
+        test_before_acquire: true,
+        charset: "utf8mb4".to_string(),
+        timezone: None,
+        table_sharding: None,
     };
-    let resource = Arc::new(MySqlResource::connect_lazy(&MySqlResourceConfig {
-        reader: pool.clone(),
-        writer: pool,
-    })?);
-    brz_mysql::query("SELECT 1")
-        .execute(resource.reader())
-        .await?;
+    let service = Arc::new(MysqlService::connect_with_options(&url, options).await?);
 
     let permits = Arc::new(Semaphore::new(concurrency));
     let started = Instant::now();
     let mut tasks = tokio::task::JoinSet::new();
     for _ in 0..operations {
         let permit = permits.clone().acquire_owned().await?;
-        let resource = resource.clone();
+        let service = service.clone();
         tasks.spawn(async move {
             let started = Instant::now();
-            let result = brz_mysql::query("SELECT 1")
-                .execute(resource.reader())
-                .await;
+            let result = service.fetch_one::<_, _, One>("SELECT 1 AS one", ()).await;
             drop(permit);
+            let result = result.map(|row| row.one);
             (started.elapsed(), result)
         });
     }
@@ -65,7 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         percentile(&latencies, 99).as_micros(),
         latencies.last().copied().unwrap_or_default().as_micros(),
     );
-    resource.close().await;
+    service.close().await;
     if errors > 0 {
         return Err(format!("{errors} operations failed").into());
     }
