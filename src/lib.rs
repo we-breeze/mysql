@@ -10,13 +10,19 @@ extern crate self as brz_mysql;
 mod api;
 mod arguments;
 mod mysql_service;
+mod routed_transaction;
+mod routing;
 mod row;
+mod sharded_service;
 
 pub use api::{
-    Mysql, MysqlError, MysqlExecution, MysqlResult, MysqlServiceOptions, MysqlTableSelection,
-    MysqlTableSelector, MysqlTableSharding, MysqlTransaction, PoolStats,
+    Mysql, MysqlError, MysqlExecution, MysqlResult, MysqlServiceOptions, MysqlTransaction,
+    PoolStats,
 };
-pub use arguments::{Json, MysqlArgs, MysqlSelectorValue, MysqlValue, MysqlValueWriter};
+pub use arguments::{Json, MysqlArgs, MysqlRouteValue, MysqlValue, MysqlValueWriter};
 pub use brz_mysql_derive::FromMysqlRow;
 pub use mysql_service::{MysqlService, MysqlTransactionService};
+pub use routed_transaction::RoutedMysqlTransaction;
+pub use routing::{MysqlRoute, MysqlRouting};
 pub use row::{FromMysqlRow, FromMysqlValue, MysqlRow};
+pub use sharded_service::ShardedMysqlService;
