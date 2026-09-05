@@ -5,6 +5,30 @@ use syn::{
     parse_quote,
 };
 
+/// Decode a serde-owned application type directly from one JSON column.
+#[proc_macro_derive(FromMysqlCol)]
+pub fn derive_from_mysql_col(input: TokenStream) -> TokenStream {
+    let mut input = parse_macro_input!(input as DeriveInput);
+    let name = &input.ident;
+    input
+        .generics
+        .make_where_clause()
+        .predicates
+        .push(parse_quote!(::brz_mysql::Json<Self>: ::brz_mysql::FromMysqlCol));
+    let (impl_generics, type_generics, where_clause) = input.generics.split_for_impl();
+    quote! {
+        impl #impl_generics ::brz_mysql::FromMysqlCol for #name #type_generics #where_clause {
+            fn from_mysql_col(row: &::brz_mysql::MysqlRow, index: usize)
+                -> ::brz_mysql::MysqlResult<Self>
+            {
+                <::brz_mysql::Json<Self> as ::brz_mysql::FromMysqlCol>::from_mysql_col(row, index)
+                    .map(::brz_mysql::Json::into_inner)
+            }
+        }
+    }
+    .into()
+}
+
 #[proc_macro_derive(FromMysqlRow, attributes(mysql))]
 pub fn derive_from_mysql_row(input: TokenStream) -> TokenStream {
     expand(parse_macro_input!(input as DeriveInput))

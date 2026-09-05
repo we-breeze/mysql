@@ -38,6 +38,10 @@ pub enum MysqlError {
     RowNotFound,
     #[error("MySQL column {0:?} was not found")]
     ColumnNotFound(String),
+    #[error("MySQL column index {index} is outside a row with {len} columns")]
+    ColumnIndexOutOfBounds { index: usize, len: usize },
+    #[error("MySQL result has {actual} columns; expected {expected}")]
+    ColumnCount { expected: usize, actual: usize },
     #[error("MySQL column {column:?} unexpectedly contained NULL")]
     UnexpectedNull { column: String },
     #[error("cannot decode MySQL column {column:?} as {expected}")]

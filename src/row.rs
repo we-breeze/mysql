@@ -1,18 +1,10 @@
-//! Direct, typed decoding from SQLx MySQL rows.
+//! Driver-owned rows and typed application result shapes.
 
-use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
-use serde::de::DeserializeOwned;
-use sqlx::{
-    Column, Decode, MySql, Row as _, Type, TypeInfo, ValueRef as _,
-    mysql::MySqlRow as SqlxMySqlRow, types::BigDecimal,
-};
+use sqlx::{Column, Row as _, ValueRef as _, mysql::MySqlRow as SqlxMySqlRow};
 
-use crate::{Json, MysqlError, MysqlResult};
+use crate::{FromMysqlCol, MysqlError, MysqlResult};
 
-/// One driver-owned MySQL row.
-///
-/// Values stay in the original result buffer and are decoded only when the
-/// target type requests them. No intermediate map or value enum is built.
+/// One driver-owned MySQL row. Values are decoded directly from its buffer.
 #[derive(Debug)]
 pub struct MysqlRow {
     pub(crate) inner: SqlxMySqlRow,
@@ -27,12 +19,15 @@ impl MysqlRow {
         self.inner.columns().iter().map(Column::name)
     }
 
+    /// Decode a column by its zero-based position, including `Option<T>` for NULL.
+    pub fn get_at<T: FromMysqlCol>(&self, index: usize) -> MysqlResult<T> {
+        self.column_name(index)?;
+        T::from_mysql_col(self, index)
+    }
+
     pub fn get<T: FromMysqlValue>(&self, column: &str) -> MysqlResult<Option<T>> {
-        let raw = self
-            .inner
-            .try_get_raw(column)
-            .map_err(|error| column_error(column, "supported MySQL value", error))?;
-        if raw.is_null() {
+        let index = self.column_index(column)?;
+        if self.is_null(index)? {
             Ok(None)
         } else {
             T::from_mysql_value(self, column).map(Some)
@@ -45,20 +40,59 @@ impl MysqlRow {
         })
     }
 
-    pub(crate) fn type_name(&self, column: &str) -> MysqlResult<String> {
+    pub(crate) fn column_name(&self, index: usize) -> MysqlResult<&str> {
+        self.inner.columns().get(index).map(Column::name).ok_or(
+            MysqlError::ColumnIndexOutOfBounds {
+                index,
+                len: self.inner.columns().len(),
+            },
+        )
+    }
+
+    fn column_index(&self, column: &str) -> MysqlResult<usize> {
         self.inner
-            .try_get_raw(column)
-            .map(|raw| raw.type_info().name().to_ascii_uppercase())
-            .map_err(|error| column_error(column, "supported MySQL value", error))
+            .try_column(column)
+            .map(Column::ordinal)
+            .map_err(|_| MysqlError::ColumnNotFound(column.to_string()))
+    }
+
+    pub(crate) fn is_null(&self, index: usize) -> MysqlResult<bool> {
+        self.column_name(index)?;
+        self.inner
+            .try_get_raw(index)
+            .map(|value| value.is_null())
+            .map_err(|_| MysqlError::ColumnIndexOutOfBounds {
+                index,
+                len: self.inner.columns().len(),
+            })
+    }
+
+    fn expect_columns(&self, expected: usize) -> MysqlResult<()> {
+        let actual = self.inner.columns().len();
+        if actual == expected {
+            Ok(())
+        } else {
+            Err(MysqlError::ColumnCount { expected, actual })
+        }
     }
 }
 
-/// Converts one non-null column directly from a driver-owned row.
+/// Named non-null decoding used by `MysqlRow::get` and struct derives.
+/// Existing custom implementations remain supported. New column types can
+/// implement `FromMysqlCol` to gain both named and positional decoding.
 pub trait FromMysqlValue: Sized {
     fn from_mysql_value(row: &MysqlRow, column: &str) -> MysqlResult<Self>;
 }
 
-/// Converts an owned driver row into an application value.
+impl<T: FromMysqlCol> FromMysqlValue for T {
+    fn from_mysql_value(row: &MysqlRow, column: &str) -> MysqlResult<Self> {
+        row.get_at(row.column_index(column)?)
+    }
+}
+
+/// Converts a row into a scalar, positional tuple, or named application struct.
+/// Scalars require one column; tuples require exactly their number of elements.
+/// Use `#[derive(FromMysqlRow)]` to decode a business struct by field name.
 pub trait FromMysqlRow: Sized {
     fn from_mysql_row(row: MysqlRow) -> MysqlResult<Self>;
 }
@@ -69,121 +103,37 @@ impl FromMysqlRow for MysqlRow {
     }
 }
 
-fn decode<'row, T>(row: &'row MysqlRow, column: &str, expected: &'static str) -> MysqlResult<T>
-where
-    T: Decode<'row, MySql> + Type<MySql>,
-{
-    row.inner
-        .try_get(column)
-        .map_err(|error| column_error(column, expected, error))
-}
-
-fn column_error(column: &str, expected: &'static str, error: sqlx::Error) -> MysqlError {
-    match error {
-        sqlx::Error::ColumnNotFound(_) => MysqlError::ColumnNotFound(column.to_string()),
-        _ => MysqlError::Decode {
-            column: column.to_string(),
-            expected,
-        },
+impl<T: FromMysqlCol> FromMysqlRow for T {
+    fn from_mysql_row(row: MysqlRow) -> MysqlResult<Self> {
+        row.expect_columns(1)?;
+        row.get_at(0)
     }
 }
 
-impl FromMysqlValue for String {
-    fn from_mysql_value(row: &MysqlRow, column: &str) -> MysqlResult<Self> {
-        match row.type_name(column)?.as_str() {
-            "DECIMAL" | "NEWDECIMAL" => {
-                decode::<BigDecimal>(row, column, "decimal").map(|value| value.to_string())
-            }
-            _ => decode(row, column, "string"),
-        }
-    }
-}
-
-impl FromMysqlValue for Vec<u8> {
-    fn from_mysql_value(row: &MysqlRow, column: &str) -> MysqlResult<Self> {
-        decode(row, column, "bytes")
-    }
-}
-
-impl FromMysqlValue for bool {
-    fn from_mysql_value(row: &MysqlRow, column: &str) -> MysqlResult<Self> {
-        decode(row, column, "boolean")
-    }
-}
-
-macro_rules! decode_value {
-    ($expected:literal; $($type:ty),+ $(,)?) => {$(
-        impl FromMysqlValue for $type {
-            fn from_mysql_value(row: &MysqlRow, column: &str) -> MysqlResult<Self> {
-                decode(row, column, $expected)
+macro_rules! tuple_row {
+    ($count:literal; $($type:ident:$index:tt),+ $(,)?) => {
+        impl<$($type: FromMysqlCol),+> FromMysqlRow for ($($type,)+) {
+            fn from_mysql_row(row: MysqlRow) -> MysqlResult<Self> {
+                row.expect_columns($count)?;
+                Ok(($(row.get_at::<$type>($index)?,)+))
             }
         }
-    )+};
+    };
 }
 
-decode_value!("signed integer"; i8, i16, i32, i64);
-decode_value!("unsigned integer"; u8, u16, u32, u64);
-decode_value!("floating-point number"; f32);
-decode_value!("date"; NaiveDate);
-decode_value!("datetime"; NaiveDateTime);
-decode_value!("time"; NaiveTime);
-decode_value!("decimal"; BigDecimal);
-
-impl FromMysqlValue for isize {
-    fn from_mysql_value(row: &MysqlRow, column: &str) -> MysqlResult<Self> {
-        let value = i64::from_mysql_value(row, column)?;
-        Self::try_from(value).map_err(|_| MysqlError::Decode {
-            column: column.to_string(),
-            expected: "isize",
-        })
-    }
-}
-
-impl FromMysqlValue for usize {
-    fn from_mysql_value(row: &MysqlRow, column: &str) -> MysqlResult<Self> {
-        let value = u64::from_mysql_value(row, column)?;
-        Self::try_from(value).map_err(|_| MysqlError::Decode {
-            column: column.to_string(),
-            expected: "usize",
-        })
-    }
-}
-
-impl FromMysqlValue for f64 {
-    fn from_mysql_value(row: &MysqlRow, column: &str) -> MysqlResult<Self> {
-        if row.type_name(column)? == "FLOAT" {
-            f32::from_mysql_value(row, column).map(f64::from)
-        } else {
-            decode(row, column, "floating-point number")
-        }
-    }
-}
-
-impl<T> FromMysqlValue for Json<T>
-where
-    T: DeserializeOwned,
-{
-    fn from_mysql_value(row: &MysqlRow, column: &str) -> MysqlResult<Self> {
-        decode::<sqlx::types::Json<T>>(row, column, "JSON").map(|value| Json(value.0))
-    }
-}
-
-impl FromMysqlValue for serde_json::Value {
-    fn from_mysql_value(row: &MysqlRow, column: &str) -> MysqlResult<Self> {
-        Json::<Self>::from_mysql_value(row, column).map(Json::into_inner)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn accepts_application_row<T: FromMysqlRow>() {}
-    fn accepts_column<T: FromMysqlValue>() {}
-
-    #[test]
-    fn public_conversion_contracts_accept_json_and_rows() {
-        accepts_application_row::<MysqlRow>();
-        accepts_column::<Json<serde_json::Value>>();
-    }
-}
+tuple_row!(1; A:0);
+tuple_row!(2; A:0, B:1);
+tuple_row!(3; A:0, B:1, C:2);
+tuple_row!(4; A:0, B:1, C:2, D:3);
+tuple_row!(5; A:0, B:1, C:2, D:3, E:4);
+tuple_row!(6; A:0, B:1, C:2, D:3, E:4, F:5);
+tuple_row!(7; A:0, B:1, C:2, D:3, E:4, F:5, G:6);
+tuple_row!(8; A:0, B:1, C:2, D:3, E:4, F:5, G:6, H:7);
+tuple_row!(9; A:0, B:1, C:2, D:3, E:4, F:5, G:6, H:7, I:8);
+tuple_row!(10; A:0, B:1, C:2, D:3, E:4, F:5, G:6, H:7, I:8, J:9);
+tuple_row!(11; A:0, B:1, C:2, D:3, E:4, F:5, G:6, H:7, I:8, J:9, K:10);
+tuple_row!(12; A:0, B:1, C:2, D:3, E:4, F:5, G:6, H:7, I:8, J:9, K:10, L:11);
+tuple_row!(13; A:0, B:1, C:2, D:3, E:4, F:5, G:6, H:7, I:8, J:9, K:10, L:11, M:12);
+tuple_row!(14; A:0, B:1, C:2, D:3, E:4, F:5, G:6, H:7, I:8, J:9, K:10, L:11, M:12, N:13);
+tuple_row!(15; A:0, B:1, C:2, D:3, E:4, F:5, G:6, H:7, I:8, J:9, K:10, L:11, M:12, N:13, O:14);
+tuple_row!(16; A:0, B:1, C:2, D:3, E:4, F:5, G:6, H:7, I:8, J:9, K:10, L:11, M:12, N:13, O:14, P:15);
