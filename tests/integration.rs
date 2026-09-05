@@ -3,8 +3,8 @@
 use std::time::Duration;
 
 use brz_mysql::{
-    FromMysqlRow, Json, Mysql, MysqlError, MysqlResult, MysqlRow, MysqlSelectorValue, MysqlService,
-    MysqlServiceOptions, MysqlTableSelection, MysqlTableSharding, MysqlTransaction,
+    FromMysqlRow, Json, Mysql, MysqlError, MysqlResult, MysqlRoute, MysqlRouteValue, MysqlRow,
+    MysqlService, MysqlServiceOptions, MysqlTransaction,
 };
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use futures_util::{StreamExt, pin_mut};
@@ -21,7 +21,6 @@ fn options() -> MysqlServiceOptions {
         test_before_acquire: true,
         charset: "utf8mb4".to_string(),
         timezone: Some("+08:00".to_string()),
-        table_sharding: None,
     }
 }
 
@@ -327,7 +326,7 @@ struct RoutedRow {
 }
 
 #[tokio::test]
-async fn table_selector_uses_the_first_sql_argument() {
+async fn routed_service_uses_first_argument_without_rebinding_it() {
     let Some(url) = test_url() else {
         eprintln!("skipping: BREEZE_MYSQL_TEST_URL not set");
         return;
@@ -347,17 +346,10 @@ async fn table_selector_uses_the_first_sql_argument() {
             .unwrap();
     }
 
-    let sharding = MysqlTableSharding::new(
-        16,
-        ["brz_mysql_route_it"],
-        |first: MysqlSelectorValue<'_>| {
-            Ok(MysqlTableSelection::Shard((first.as_u64()? % 16) as u32))
-        },
-    )
-    .unwrap();
-    let routed = MysqlService::connect_with_options(&url, options().with_table_sharding(sharding))
-        .await
-        .unwrap();
+    let routed = plain.with_route(|key: MysqlRouteValue<'_>| {
+        let suffix = format!("{:04}", key.as_u64()? % 16);
+        MysqlRoute::new().with_table("brz_mysql_route_it", format!("brz_mysql_route_it_{suffix}"))
+    });
 
     routed
         .execute(
@@ -391,7 +383,6 @@ async fn table_selector_uses_the_first_sql_argument() {
         .unwrap_err();
     assert!(matches!(missing, MysqlError::InvalidQuery { .. }));
 
-    routed.close().await;
     plain.close().await;
 }
 
@@ -400,4 +391,30 @@ fn manual_mapping_example(row: MysqlRow) -> MysqlResult<TextRow> {
     Ok(TextRow {
         value: row.get_required("value")?,
     })
+}
+
+#[tokio::test]
+async fn default_connection_retains_driver_charset_and_sql_modes() {
+    let Some(url) = test_url() else {
+        eprintln!("skipping: BREEZE_MYSQL_TEST_URL not set");
+        return;
+    };
+    let service = MysqlService::connect(&url).await.unwrap();
+    #[derive(FromMysqlRow)]
+    struct Session {
+        sql_mode: String,
+        charset: String,
+    }
+    let session: Session = service
+        .fetch_one(
+            "SELECT @@session.sql_mode AS sql_mode, @@session.character_set_client AS charset",
+            (),
+        )
+        .await
+        .unwrap();
+    assert_eq!(session.charset, "utf8mb4");
+    for required in ["PIPES_AS_CONCAT", "NO_ENGINE_SUBSTITUTION"] {
+        assert!(session.sql_mode.split(',').any(|mode| mode == required));
+    }
+    service.close().await;
 }

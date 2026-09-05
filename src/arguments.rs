@@ -9,9 +9,9 @@ use sqlx::{
 
 use crate::{MysqlError, MysqlResult};
 
-/// A borrowed, allocation-free view used only by a configured table selector.
+/// A borrowed, allocation-free view of an explicit or first-argument routing key.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum MysqlSelectorValue<'a> {
+pub enum MysqlRouteValue<'a> {
     Null,
     Bool(bool),
     I64(i64),
@@ -25,41 +25,41 @@ pub enum MysqlSelectorValue<'a> {
     Unsupported(&'static str),
 }
 
-impl<'value> MysqlSelectorValue<'value> {
+impl<'value> MysqlRouteValue<'value> {
     pub fn as_u64(self) -> MysqlResult<u64> {
         match self {
             Self::U64(value) => Ok(value),
-            Self::I64(value) => u64::try_from(value).map_err(|_| selector_type_error("u64")),
-            _ => Err(selector_type_error("u64")),
+            Self::I64(value) => u64::try_from(value).map_err(|_| route_type_error("u64")),
+            _ => Err(route_type_error("u64")),
         }
     }
 
     pub fn as_i64(self) -> MysqlResult<i64> {
         match self {
             Self::I64(value) => Ok(value),
-            Self::U64(value) => i64::try_from(value).map_err(|_| selector_type_error("i64")),
-            _ => Err(selector_type_error("i64")),
+            Self::U64(value) => i64::try_from(value).map_err(|_| route_type_error("i64")),
+            _ => Err(route_type_error("i64")),
         }
     }
 
     pub fn as_str(self) -> MysqlResult<&'value str> {
         match self {
             Self::String(value) => Ok(value),
-            _ => Err(selector_type_error("string")),
+            _ => Err(route_type_error("string")),
         }
     }
 
     pub fn as_bytes(self) -> MysqlResult<&'value [u8]> {
         match self {
             Self::Bytes(value) => Ok(value),
-            _ => Err(selector_type_error("bytes")),
+            _ => Err(route_type_error("bytes")),
         }
     }
 }
 
-fn selector_type_error(expected: &'static str) -> MysqlError {
+fn route_type_error(expected: &'static str) -> MysqlError {
     MysqlError::InvalidQuery {
-        reason: format!("the first argument cannot be used as a {expected} table selector"),
+        reason: format!("the routing key cannot be used as {expected}"),
     }
 }
 
@@ -72,7 +72,9 @@ pub trait MysqlValue: Send {
     fn write(self, writer: &mut MysqlValueWriter) -> MysqlResult<()>;
 
     #[doc(hidden)]
-    fn selector_value(&self) -> MysqlSelectorValue<'_>;
+    fn route_value(&self) -> MysqlRouteValue<'_> {
+        MysqlRouteValue::Unsupported(std::any::type_name::<Self>())
+    }
 
     #[doc(hidden)]
     fn encoded_size_hint(&self) -> usize {
@@ -92,7 +94,9 @@ pub trait MysqlArgs: Send {
     fn encoded_size_hint(&self) -> usize;
 
     #[doc(hidden)]
-    fn first_selector_value(&self) -> Option<MysqlSelectorValue<'_>>;
+    fn first_route_value(&self) -> Option<MysqlRouteValue<'_>> {
+        None
+    }
 
     #[doc(hidden)]
     fn write(self, writer: &mut MysqlValueWriter) -> MysqlResult<()>;
@@ -161,8 +165,8 @@ macro_rules! signed_value {
                 writer.push_sqlx(self)
             }
 
-            fn selector_value(&self) -> MysqlSelectorValue<'_> {
-                MysqlSelectorValue::I64(*self as i64)
+            fn route_value(&self) -> MysqlRouteValue<'_> {
+                MysqlRouteValue::I64(*self as i64)
             }
 
             fn encoded_size_hint(&self) -> usize {
@@ -179,8 +183,8 @@ macro_rules! unsigned_value {
                 writer.push_sqlx(self)
             }
 
-            fn selector_value(&self) -> MysqlSelectorValue<'_> {
-                MysqlSelectorValue::U64(*self as u64)
+            fn route_value(&self) -> MysqlRouteValue<'_> {
+                MysqlRouteValue::U64(*self as u64)
             }
 
             fn encoded_size_hint(&self) -> usize {
@@ -198,8 +202,8 @@ impl MysqlValue for isize {
         writer.push_sqlx(self as i64)
     }
 
-    fn selector_value(&self) -> MysqlSelectorValue<'_> {
-        MysqlSelectorValue::I64(*self as i64)
+    fn route_value(&self) -> MysqlRouteValue<'_> {
+        MysqlRouteValue::I64(*self as i64)
     }
 
     fn encoded_size_hint(&self) -> usize {
@@ -212,8 +216,8 @@ impl MysqlValue for usize {
         writer.push_sqlx(self as u64)
     }
 
-    fn selector_value(&self) -> MysqlSelectorValue<'_> {
-        MysqlSelectorValue::U64(*self as u64)
+    fn route_value(&self) -> MysqlRouteValue<'_> {
+        MysqlRouteValue::U64(*self as u64)
     }
 
     fn encoded_size_hint(&self) -> usize {
@@ -226,8 +230,8 @@ impl MysqlValue for bool {
         writer.push_sqlx(self)
     }
 
-    fn selector_value(&self) -> MysqlSelectorValue<'_> {
-        MysqlSelectorValue::Bool(*self)
+    fn route_value(&self) -> MysqlRouteValue<'_> {
+        MysqlRouteValue::Bool(*self)
     }
 
     fn encoded_size_hint(&self) -> usize {
@@ -240,8 +244,8 @@ impl MysqlValue for f32 {
         writer.push_sqlx(self)
     }
 
-    fn selector_value(&self) -> MysqlSelectorValue<'_> {
-        MysqlSelectorValue::F64(f64::from(*self))
+    fn route_value(&self) -> MysqlRouteValue<'_> {
+        MysqlRouteValue::F64(f64::from(*self))
     }
 
     fn encoded_size_hint(&self) -> usize {
@@ -254,8 +258,8 @@ impl MysqlValue for f64 {
         writer.push_sqlx(self)
     }
 
-    fn selector_value(&self) -> MysqlSelectorValue<'_> {
-        MysqlSelectorValue::F64(*self)
+    fn route_value(&self) -> MysqlRouteValue<'_> {
+        MysqlRouteValue::F64(*self)
     }
 
     fn encoded_size_hint(&self) -> usize {
@@ -268,8 +272,8 @@ impl MysqlValue for String {
         writer.push_sqlx(self)
     }
 
-    fn selector_value(&self) -> MysqlSelectorValue<'_> {
-        MysqlSelectorValue::String(self)
+    fn route_value(&self) -> MysqlRouteValue<'_> {
+        MysqlRouteValue::String(self)
     }
 
     fn encoded_size_hint(&self) -> usize {
@@ -282,8 +286,8 @@ impl MysqlValue for &str {
         writer.push_sqlx(self)
     }
 
-    fn selector_value(&self) -> MysqlSelectorValue<'_> {
-        MysqlSelectorValue::String(self)
+    fn route_value(&self) -> MysqlRouteValue<'_> {
+        MysqlRouteValue::String(self)
     }
 
     fn encoded_size_hint(&self) -> usize {
@@ -296,8 +300,8 @@ impl MysqlValue for Vec<u8> {
         writer.push_sqlx(self)
     }
 
-    fn selector_value(&self) -> MysqlSelectorValue<'_> {
-        MysqlSelectorValue::Bytes(self)
+    fn route_value(&self) -> MysqlRouteValue<'_> {
+        MysqlRouteValue::Bytes(self)
     }
 
     fn encoded_size_hint(&self) -> usize {
@@ -310,8 +314,8 @@ impl MysqlValue for &[u8] {
         writer.push_sqlx(self)
     }
 
-    fn selector_value(&self) -> MysqlSelectorValue<'_> {
-        MysqlSelectorValue::Bytes(self)
+    fn route_value(&self) -> MysqlRouteValue<'_> {
+        MysqlRouteValue::Bytes(self)
     }
 
     fn encoded_size_hint(&self) -> usize {
@@ -324,8 +328,8 @@ impl MysqlValue for NaiveDate {
         writer.push_sqlx(self)
     }
 
-    fn selector_value(&self) -> MysqlSelectorValue<'_> {
-        MysqlSelectorValue::Date(*self)
+    fn route_value(&self) -> MysqlRouteValue<'_> {
+        MysqlRouteValue::Date(*self)
     }
 }
 
@@ -334,8 +338,8 @@ impl MysqlValue for NaiveDateTime {
         writer.push_sqlx(self)
     }
 
-    fn selector_value(&self) -> MysqlSelectorValue<'_> {
-        MysqlSelectorValue::DateTime(*self)
+    fn route_value(&self) -> MysqlRouteValue<'_> {
+        MysqlRouteValue::DateTime(*self)
     }
 }
 
@@ -344,8 +348,8 @@ impl MysqlValue for NaiveTime {
         writer.push_sqlx(self)
     }
 
-    fn selector_value(&self) -> MysqlSelectorValue<'_> {
-        MysqlSelectorValue::Time(*self)
+    fn route_value(&self) -> MysqlRouteValue<'_> {
+        MysqlRouteValue::Time(*self)
     }
 }
 
@@ -354,8 +358,8 @@ impl MysqlValue for BigDecimal {
         writer.push_sqlx(self)
     }
 
-    fn selector_value(&self) -> MysqlSelectorValue<'_> {
-        MysqlSelectorValue::Unsupported("decimal")
+    fn route_value(&self) -> MysqlRouteValue<'_> {
+        MysqlRouteValue::Unsupported("decimal")
     }
 }
 
@@ -367,8 +371,8 @@ where
         writer.push_sqlx(sqlx::types::Json(self.0))
     }
 
-    fn selector_value(&self) -> MysqlSelectorValue<'_> {
-        MysqlSelectorValue::Unsupported("JSON")
+    fn route_value(&self) -> MysqlRouteValue<'_> {
+        MysqlRouteValue::Unsupported("JSON")
     }
 }
 
@@ -377,8 +381,8 @@ impl MysqlValue for serde_json::Value {
         Json(self).write(writer)
     }
 
-    fn selector_value(&self) -> MysqlSelectorValue<'_> {
-        MysqlSelectorValue::Unsupported("JSON")
+    fn route_value(&self) -> MysqlRouteValue<'_> {
+        MysqlRouteValue::Unsupported("JSON")
     }
 }
 
@@ -393,10 +397,10 @@ where
         }
     }
 
-    fn selector_value(&self) -> MysqlSelectorValue<'_> {
+    fn route_value(&self) -> MysqlRouteValue<'_> {
         match self {
-            Some(value) => value.selector_value(),
-            None => MysqlSelectorValue::Null,
+            Some(value) => value.route_value(),
+            None => MysqlRouteValue::Null,
         }
     }
 
@@ -414,7 +418,7 @@ impl MysqlArgs for () {
         0
     }
 
-    fn first_selector_value(&self) -> Option<MysqlSelectorValue<'_>> {
+    fn first_route_value(&self) -> Option<MysqlRouteValue<'_>> {
         None
     }
 
@@ -435,8 +439,8 @@ where
         self.iter().map(MysqlValue::encoded_size_hint).sum()
     }
 
-    fn first_selector_value(&self) -> Option<MysqlSelectorValue<'_>> {
-        self.first().map(MysqlValue::selector_value)
+    fn first_route_value(&self) -> Option<MysqlRouteValue<'_>> {
+        self.first().map(MysqlValue::route_value)
     }
 
     fn write(self, writer: &mut MysqlValueWriter) -> MysqlResult<()> {
@@ -459,8 +463,8 @@ where
         self.iter().map(MysqlValue::encoded_size_hint).sum()
     }
 
-    fn first_selector_value(&self) -> Option<MysqlSelectorValue<'_>> {
-        self.first().map(MysqlValue::selector_value)
+    fn first_route_value(&self) -> Option<MysqlRouteValue<'_>> {
+        self.first().map(MysqlValue::route_value)
     }
 
     fn write(self, writer: &mut MysqlValueWriter) -> MysqlResult<()> {
@@ -486,8 +490,8 @@ macro_rules! tuple_args {
                 self.0.encoded_size_hint() $(+ self.$index.encoded_size_hint())*
             }
 
-            fn first_selector_value(&self) -> Option<MysqlSelectorValue<'_>> {
-                Some(self.0.selector_value())
+            fn first_route_value(&self) -> Option<MysqlRouteValue<'_>> {
+                Some(self.0.route_value())
             }
 
             fn write(self, writer: &mut MysqlValueWriter) -> MysqlResult<()> {
@@ -534,8 +538,8 @@ mod tests {
             writer.push(self.0)
         }
 
-        fn selector_value(&self) -> MysqlSelectorValue<'_> {
-            self.0.selector_value()
+        fn route_value(&self) -> MysqlRouteValue<'_> {
+            self.0.route_value()
         }
 
         fn encoded_size_hint(&self) -> usize {
@@ -544,13 +548,10 @@ mod tests {
     }
 
     #[test]
-    fn heterogeneous_tuple_exposes_first_selector_without_a_value_vector() {
+    fn heterogeneous_tuple_exposes_first_routing_key_without_a_value_vector() {
         let arguments = (TaskId(17), "task", Option::<i64>::None);
         assert_eq!(arguments.len(), 3);
-        assert_eq!(
-            arguments.first_selector_value().unwrap().as_u64().unwrap(),
-            17
-        );
+        assert_eq!(arguments.first_route_value().unwrap().as_u64().unwrap(), 17);
         encode_arguments(arguments).unwrap();
     }
 

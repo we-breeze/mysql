@@ -1,6 +1,6 @@
 //! SQLx-backed implementation of the public MySQL contract.
 
-use std::{borrow::Cow, str::FromStr, sync::Arc};
+use std::{borrow::Cow, str::FromStr};
 
 use async_stream::stream;
 use futures_core::Stream;
@@ -11,16 +11,15 @@ use sqlx::{
 };
 
 use crate::{
-    FromMysqlRow, Mysql, MysqlArgs, MysqlError, MysqlExecution, MysqlResult, MysqlRow,
-    MysqlSelectorValue, MysqlServiceOptions, MysqlTableSelection, MysqlTableSharding,
-    MysqlTransaction, arguments::encode_arguments,
+    FromMysqlRow, Mysql, MysqlArgs, MysqlError, MysqlExecution, MysqlResult, MysqlRouting,
+    MysqlRow, MysqlServiceOptions, MysqlTransaction, ShardedMysqlService,
+    arguments::encode_arguments, routing::render_sql, sharded_service::QueryRouting,
 };
 
 /// SQLx-backed MySQL service.
 #[derive(Clone, Debug)]
 pub struct MysqlService {
     pool: MySqlPool,
-    table_sharding: Option<Arc<MysqlTableSharding>>,
 }
 
 impl MysqlService {
@@ -37,10 +36,7 @@ impl MysqlService {
             .connect_with(connect_options)
             .await
             .map_err(map_sqlx_error)?;
-        Ok(Self {
-            pool,
-            table_sharding: options.table_sharding.map(Arc::new),
-        })
+        Ok(Self { pool })
     }
 
     pub fn connect_lazy(url: &str) -> MysqlResult<Self> {
@@ -51,8 +47,12 @@ impl MysqlService {
         let (connect_options, pool_options) = build_options(url, &options)?;
         Ok(Self {
             pool: pool_options.connect_lazy_with(connect_options),
-            table_sharding: options.table_sharding.map(Arc::new),
         })
+    }
+
+    /// Create an owned routed handle without allocating another connection pool.
+    pub fn with_route<R: MysqlRouting + 'static>(&self, routing: R) -> ShardedMysqlService {
+        ShardedMysqlService::new(self.clone(), routing)
     }
 
     pub async fn execute<S, A>(&self, sql: S, arguments: A) -> MysqlResult<MysqlExecution>
@@ -60,8 +60,7 @@ impl MysqlService {
         S: AsRef<str> + Send,
         A: MysqlArgs + Send,
     {
-        let (sql, arguments) =
-            prepare_query(sql.as_ref(), arguments, self.table_sharding.as_deref())?;
+        let (sql, arguments) = prepare_query(sql.as_ref(), arguments, None)?;
         sqlx::query_with::<MySql, _>(sql.as_ref(), arguments)
             .execute(&self.pool)
             .await
@@ -75,8 +74,7 @@ impl MysqlService {
         A: MysqlArgs + Send,
         T: FromMysqlRow + Send,
     {
-        let (sql, arguments) =
-            prepare_query(sql.as_ref(), arguments, self.table_sharding.as_deref())?;
+        let (sql, arguments) = prepare_query(sql.as_ref(), arguments, None)?;
         sqlx::query_with::<MySql, _>(sql.as_ref(), arguments)
             .fetch_optional(&self.pool)
             .await
@@ -111,7 +109,7 @@ impl MysqlService {
             let (sql, arguments) = match prepare_query(
                 sql.as_ref(),
                 arguments,
-                self.table_sharding.as_deref(),
+                None,
             ) {
                 Ok(prepared) => prepared,
                 Err(error) => {
@@ -151,7 +149,22 @@ impl MysqlService {
             ) -> MysqlResult<T>
             + Send,
     {
-        let mut transaction = self.begin().await?;
+        self.run_transaction(None, operation).await
+    }
+
+    pub(crate) async fn run_transaction<T, F>(
+        &self,
+        route: Option<QueryRouting>,
+        operation: F,
+    ) -> MysqlResult<T>
+    where
+        T: Send,
+        F: for<'transaction> AsyncFnOnce(
+                &'transaction mut MysqlTransactionService,
+            ) -> MysqlResult<T>
+            + Send,
+    {
+        let mut transaction = self.begin(route).await?;
         match operation(&mut transaction).await {
             Ok(value) => {
                 transaction.commit().await?;
@@ -187,13 +200,13 @@ impl MysqlService {
         self.pool.close().await;
     }
 
-    async fn begin(&self) -> MysqlResult<MysqlTransactionService> {
+    async fn begin(&self, route: Option<QueryRouting>) -> MysqlResult<MysqlTransactionService> {
         self.pool
             .begin()
             .await
             .map(|inner| MysqlTransactionService {
                 inner: Some(inner),
-                table_sharding: self.table_sharding.clone(),
+                route,
             })
             .map_err(map_sqlx_error)
     }
@@ -201,6 +214,10 @@ impl MysqlService {
 
 impl Mysql for MysqlService {
     type Transaction = MysqlTransactionService;
+
+    fn with_route<R: MysqlRouting + 'static>(&self, routing: R) -> ShardedMysqlService {
+        MysqlService::with_route(self, routing)
+    }
 
     async fn execute<S, A>(&self, sql: S, arguments: A) -> MysqlResult<MysqlExecution>
     where
@@ -263,7 +280,7 @@ impl Mysql for MysqlService {
 /// Scoped transaction value created only by MysqlService::with_transaction.
 pub struct MysqlTransactionService {
     inner: Option<sqlx::Transaction<'static, MySql>>,
-    table_sharding: Option<Arc<MysqlTableSharding>>,
+    route: Option<QueryRouting>,
 }
 
 impl std::fmt::Debug for MysqlTransactionService {
@@ -275,6 +292,16 @@ impl std::fmt::Debug for MysqlTransactionService {
 }
 
 impl MysqlTransactionService {
+    /// Bind a key for queries on this same transaction connection. The
+    /// transaction's default routing key is unchanged after this view is dropped.
+    pub fn route<K: crate::MysqlValue + Sync + 'static>(
+        &mut self,
+        key: K,
+    ) -> crate::RoutedMysqlTransaction<'_> {
+        let routing = self.route.as_ref().map(|routing| routing.with_key(key));
+        crate::RoutedMysqlTransaction::new(self, routing)
+    }
+
     fn inner(&mut self) -> MysqlResult<&mut sqlx::Transaction<'static, MySql>> {
         self.inner.as_mut().ok_or_else(|| MysqlError::Database {
             code: None,
@@ -308,8 +335,7 @@ impl MysqlTransaction for MysqlTransactionService {
         S: AsRef<str> + Send,
         A: MysqlArgs + Send,
     {
-        let (sql, arguments) =
-            prepare_query(sql.as_ref(), arguments, self.table_sharding.as_deref())?;
+        let (sql, arguments) = prepare_query(sql.as_ref(), arguments, self.route.as_ref())?;
         sqlx::query_with::<MySql, _>(sql.as_ref(), arguments)
             .execute(&mut **self.inner()?)
             .await
@@ -323,8 +349,7 @@ impl MysqlTransaction for MysqlTransactionService {
         A: MysqlArgs + Send,
         T: FromMysqlRow + Send,
     {
-        let (sql, arguments) =
-            prepare_query(sql.as_ref(), arguments, self.table_sharding.as_deref())?;
+        let (sql, arguments) = prepare_query(sql.as_ref(), arguments, self.route.as_ref())?;
         sqlx::query_with::<MySql, _>(sql.as_ref(), arguments)
             .fetch_optional(&mut **self.inner()?)
             .await
@@ -358,7 +383,7 @@ impl MysqlTransaction for MysqlTransactionService {
             let (sql, arguments) = match prepare_query(
                 sql.as_ref(),
                 arguments,
-                self.table_sharding.as_deref(),
+                self.route.as_ref(),
             ) {
                 Ok(prepared) => prepared,
                 Err(error) => {
@@ -398,75 +423,35 @@ impl MysqlTransaction for MysqlTransactionService {
     }
 }
 
-fn prepare_query<'sql, A>(
+pub(crate) fn prepare_query<'sql, A>(
     sql: &'sql str,
     arguments: A,
-    sharding: Option<&MysqlTableSharding>,
+    route: Option<&QueryRouting>,
 ) -> MysqlResult<(Cow<'sql, str>, sqlx::mysql::MySqlArguments)>
 where
     A: MysqlArgs,
 {
-    let rendered = render_sql(sql, arguments.first_selector_value(), sharding)?;
+    let rendered = render_query(sql, &arguments, route)?;
     let encoded = encode_arguments(arguments)?;
     Ok((rendered, encoded))
 }
 
-fn render_sql<'sql>(
+/// Plain statements bypass table routing, including inside a sharded transaction.
+pub(crate) fn render_query<'sql, A: MysqlArgs>(
     sql: &'sql str,
-    first: Option<MysqlSelectorValue<'_>>,
-    sharding: Option<&MysqlTableSharding>,
+    arguments: &A,
+    routing: Option<&QueryRouting>,
 ) -> MysqlResult<Cow<'sql, str>> {
-    let Some(sharding) = sharding else {
-        return Ok(Cow::Borrowed(sql));
-    };
-    let first = first.ok_or_else(|| MysqlError::InvalidQuery {
-        reason: "table-sharded MySQL requires the first SQL argument as its table selector"
-            .to_string(),
-    })?;
-    let selection = sharding.selector.select(first)?;
-    if let MysqlTableSelection::Shard(shard) = selection
-        && shard >= sharding.shard_count
-    {
-        return Err(MysqlError::InvalidQuery {
-            reason: format!(
-                "table selector returned shard {shard}, but shard_count is {}",
-                sharding.shard_count
-            ),
-        });
+    match render_sql(sql, None, false) {
+        Ok(plain) => Ok(plain),
+        Err(error) => match routing {
+            Some(routing) => {
+                let route = routing.resolve(arguments)?;
+                render_sql(sql, Some(&route), false)
+            }
+            None => Err(error),
+        },
     }
-
-    let mut output = String::with_capacity(sql.len() + 16);
-    let mut cursor = 0;
-    let mut found = false;
-    loop {
-        let next = sharding
-            .tables
-            .iter()
-            .filter_map(|table| {
-                sql[cursor..]
-                    .find(&table.token)
-                    .map(|offset| (cursor + offset, table))
-            })
-            .min_by_key(|(offset, _)| *offset);
-        let Some((offset, table)) = next else {
-            break;
-        };
-        found = true;
-        output.push_str(&sql[cursor..offset]);
-        let physical = match selection {
-            MysqlTableSelection::Base => table.base.as_str(),
-            MysqlTableSelection::Shard(shard) => &table.shards[shard as usize],
-        };
-        output.push_str(physical);
-        cursor = offset + table.token.len();
-    }
-    if !found {
-        return Err(MysqlError::InvalidQuery {
-            reason: "table-sharded SQL must contain a configured logical-table token".to_string(),
-        });
-    }
-    output.push_str(&sql[cursor..]);
-    Ok(Cow::Owned(output))
 }
 
 fn build_options(
@@ -572,7 +557,6 @@ mod tests {
             test_before_acquire: true,
             charset: "utf8mb4".to_string(),
             timezone: Some("+08:00".to_string()),
-            table_sharding: None,
         }
     }
 
@@ -586,45 +570,6 @@ mod tests {
         assert_eq!(service.pool_stats().size, 0);
         assert_eq!(service.pool_stats().max_connections, 4);
         service.close().await;
-    }
-
-    #[test]
-    fn selector_uses_the_first_argument_and_precomputed_table_name() {
-        let sharding = MysqlTableSharding::new(
-            16,
-            ["tasks", "subtasks"],
-            |first: MysqlSelectorValue<'_>| {
-                Ok(MysqlTableSelection::Shard((first.as_u64()? % 16) as u32))
-            },
-        )
-        .unwrap();
-        let sql = render_sql(
-            "SELECT * FROM {{tasks}} JOIN {{subtasks}} USING (id) WHERE user_id = ?",
-            Some(MysqlSelectorValue::U64(17)),
-            Some(&sharding),
-        )
-        .unwrap();
-        assert_eq!(
-            sql,
-            "SELECT * FROM tasks_0001 JOIN subtasks_0001 USING (id) WHERE user_id = ?"
-        );
-    }
-
-    #[test]
-    fn sharded_query_requires_first_argument_and_logical_table() {
-        let sharding = MysqlTableSharding::new(16, ["tasks"], |_: MysqlSelectorValue<'_>| {
-            Ok(MysqlTableSelection::Base)
-        })
-        .unwrap();
-        assert!(render_sql("SELECT * FROM {{tasks}}", None, Some(&sharding)).is_err());
-        assert!(
-            render_sql(
-                "SELECT * FROM users WHERE id = ?",
-                Some(MysqlSelectorValue::U64(1)),
-                Some(&sharding),
-            )
-            .is_err()
-        );
     }
 
     #[test]

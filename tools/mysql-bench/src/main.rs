@@ -27,7 +27,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         test_before_acquire: true,
         charset: "utf8mb4".to_string(),
         timezone: None,
-        table_sharding: None,
     };
     let service = Arc::new(MysqlService::connect_with_options(&url, options).await?);
 

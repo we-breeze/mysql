@@ -1,11 +1,11 @@
 //! Application-facing MySQL contract.
 
-use std::{collections::BTreeSet, fmt, sync::Arc, time::Duration};
+use std::time::Duration;
 
 use futures_core::Stream;
 use thiserror::Error;
 
-use crate::{FromMysqlRow, MysqlArgs, MysqlSelectorValue};
+use crate::{FromMysqlRow, MysqlArgs, MysqlRouting, ShardedMysqlService};
 
 /// Result metadata for a write statement.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -82,119 +82,7 @@ impl MysqlError {
     }
 }
 
-/// Physical table decision returned by a configured selector.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MysqlTableSelection {
-    Base,
-    Shard(u32),
-}
-
-/// Chooses a physical table from the first SQL argument.
-pub trait MysqlTableSelector: Send + Sync {
-    fn select(&self, first: MysqlSelectorValue<'_>) -> MysqlResult<MysqlTableSelection>;
-}
-
-impl<F> MysqlTableSelector for F
-where
-    F: for<'value> Fn(MysqlSelectorValue<'value>) -> MysqlResult<MysqlTableSelection> + Send + Sync,
-{
-    fn select(&self, first: MysqlSelectorValue<'_>) -> MysqlResult<MysqlTableSelection> {
-        self(first)
-    }
-}
-
-#[derive(Clone)]
-pub struct MysqlTableSharding {
-    pub(crate) shard_count: u32,
-    pub(crate) tables: Vec<MysqlLogicalTable>,
-    pub(crate) selector: Arc<dyn MysqlTableSelector>,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct MysqlLogicalTable {
-    pub(crate) logical: String,
-    pub(crate) token: String,
-    pub(crate) base: String,
-    pub(crate) shards: Vec<String>,
-}
-
-impl MysqlTableSharding {
-    pub fn new<I, N, S>(shard_count: u32, tables: I, selector: S) -> MysqlResult<Self>
-    where
-        I: IntoIterator<Item = N>,
-        N: Into<String>,
-        S: MysqlTableSelector + 'static,
-    {
-        if shard_count == 0 {
-            return Err(MysqlError::InvalidConfig {
-                reason: "table shard count must be greater than zero".to_string(),
-            });
-        }
-
-        let mut seen = BTreeSet::new();
-        let mut logical_tables = Vec::new();
-        for table in tables {
-            let table = table.into();
-            if !valid_identifier(&table) {
-                return Err(MysqlError::InvalidConfig {
-                    reason: format!("invalid logical table identifier {table:?}"),
-                });
-            }
-            if !seen.insert(table.clone()) {
-                return Err(MysqlError::InvalidConfig {
-                    reason: format!("duplicate logical table {table:?}"),
-                });
-            }
-            logical_tables.push(MysqlLogicalTable {
-                token: format!("{{{{{table}}}}}"),
-                base: table.clone(),
-                shards: (0..shard_count)
-                    .map(|shard| format!("{table}_{shard:04}"))
-                    .collect(),
-                logical: table,
-            });
-        }
-        if logical_tables.is_empty() {
-            return Err(MysqlError::InvalidConfig {
-                reason: "at least one logical table is required".to_string(),
-            });
-        }
-
-        Ok(Self {
-            shard_count,
-            tables: logical_tables,
-            selector: Arc::new(selector),
-        })
-    }
-
-    pub fn shard_count(&self) -> u32 {
-        self.shard_count
-    }
-
-    pub fn tables(&self) -> impl ExactSizeIterator<Item = &str> {
-        self.tables.iter().map(|table| table.logical.as_str())
-    }
-}
-
-impl fmt::Debug for MysqlTableSharding {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("MysqlTableSharding")
-            .field("shard_count", &self.shard_count)
-            .field("tables", &self.tables)
-            .finish_non_exhaustive()
-    }
-}
-
-fn valid_identifier(value: &str) -> bool {
-    !value.is_empty()
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-        && !value.as_bytes()[0].is_ascii_digit()
-}
-
-/// Connection-pool, session, and optional table-selection configuration.
+/// Connection-pool and session configuration.
 #[derive(Clone, Debug)]
 pub struct MysqlServiceOptions {
     pub max_connections: u32,
@@ -206,7 +94,6 @@ pub struct MysqlServiceOptions {
     pub test_before_acquire: bool,
     pub charset: String,
     pub timezone: Option<String>,
-    pub table_sharding: Option<MysqlTableSharding>,
 }
 
 impl Default for MysqlServiceOptions {
@@ -221,7 +108,6 @@ impl Default for MysqlServiceOptions {
             test_before_acquire: true,
             charset: "utf8mb4".to_string(),
             timezone: None,
-            table_sharding: None,
         }
     }
 }
@@ -274,18 +160,18 @@ impl MysqlServiceOptions {
         self.timezone = Some(value.into());
         self
     }
-
-    #[must_use]
-    pub fn with_table_sharding(mut self, value: MysqlTableSharding) -> Self {
-        self.table_sharding = Some(value);
-        self
-    }
 }
 
 /// Data-access contract consumed by repositories and application services.
 #[allow(async_fn_in_trait)]
 pub trait Mysql: Send + Sync {
     type Transaction: MysqlTransaction;
+
+    /// Bind an application routing policy to an owned handle sharing this
+    /// service's connection pool. SQL arguments remain independent of routing.
+    fn with_route<R>(&self, routing: R) -> ShardedMysqlService
+    where
+        R: MysqlRouting + 'static;
 
     async fn execute<S, A>(&self, sql: S, arguments: A) -> MysqlResult<MysqlExecution>
     where
@@ -362,32 +248,4 @@ pub trait MysqlTransaction: Send {
         S: AsRef<str> + Send,
         A: MysqlArgs + Send,
         T: FromMysqlRow + Send;
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn table_config_precomputes_physical_names() {
-        let sharding =
-            MysqlTableSharding::new(2, ["tasks", "subtasks"], |first: MysqlSelectorValue<'_>| {
-                Ok(MysqlTableSelection::Shard((first.as_u64()? % 2) as u32))
-            })
-            .unwrap();
-
-        assert_eq!(sharding.tables().collect::<Vec<_>>(), ["tasks", "subtasks"]);
-        assert_eq!(sharding.tables[0].shards, ["tasks_0000", "tasks_0001"]);
-    }
-
-    #[test]
-    fn rejects_unsafe_logical_table_identifiers() {
-        let error = MysqlTableSharding::new(
-            2,
-            ["tasks; DROP TABLE users"],
-            |_: MysqlSelectorValue<'_>| Ok(MysqlTableSelection::Base),
-        )
-        .unwrap_err();
-        assert!(matches!(error, MysqlError::InvalidConfig { .. }));
-    }
 }
