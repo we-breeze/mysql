@@ -11,13 +11,13 @@ routing within one database; it does not implement database sharding or fanout.
 
 ## Dependency
 
-Pin the Git release tag in the consuming application:
+Pin the Git revision used by these examples in the consuming application:
 
 ```toml
-brz-mysql = { git = "https://github.com/we-breeze/mysql.git", tag = "v0.0.2" }
+brz-mysql = { git = "https://github.com/we-breeze/mysql.git", rev = "c33d21e21571f0957aed1fa5f7ce54d79f70beac" }
 ```
 
-`v0.0.2` replaces the global sharding options with repository routing handles.
+Repository routing handles replace the earlier global sharding options.
 See [Migration](#migration) when upgrading from `v0.0.1`.
 
 ## Typed queries
@@ -69,8 +69,8 @@ from a JSON column.
 
 ### Scalars, tuples and JSON columns
 
-`FromMysqlCol` decodes one column by position. Implementations cover signed and
-unsigned integers, `isize`/`usize`, `f32`/`f64`, `bool`, `String`, `Vec<u8>`,
+`FromMysqlCol` decodes one column by position. Implementations cover `i8` through
+`i64`, `u8` through `u64`, `isize`/`usize`, `f32`/`f64`, `bool`, `String`, `Vec<u8>`,
 Chrono date/time types, decimals, `Json<T>`, `serde_json::Value` and `Option<T>`.
 Every column type also implements `FromMysqlRow` for exactly one column;
 tuples of 1 to 16 column types decode the same number of columns in SELECT order.
