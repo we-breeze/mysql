@@ -11,10 +11,10 @@ routing within one database; it does not implement database sharding or fanout.
 
 ## Dependency
 
-Pin the Git revision used by these examples in the consuming application:
+Pin the release tag used by these examples in the consuming application:
 
 ```toml
-brz-mysql = { git = "https://github.com/we-breeze/mysql.git", rev = "c33d21e21571f0957aed1fa5f7ce54d79f70beac" }
+brz-mysql = { git = "https://github.com/we-breeze/mysql.git", tag = "v0.0.3" }
 ```
 
 Repository routing handles replace the earlier global sharding options.
