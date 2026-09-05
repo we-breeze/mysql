@@ -2,7 +2,7 @@
 
 brz-mysql exposes an application-facing MySQL contract and keeps SQLx as its
 private wire-protocol and connection-pool driver. Repositories provide SQL,
-typed arguments, result structs, and application-owned routing policies. They do
+typed arguments, business result types, and application-owned routing policies. They do
 not handle SQLx rows, connection acquisition, or transaction completion.
 
 Create one process-lifetime MysqlService per database dependency. Ordinary and
@@ -62,10 +62,63 @@ items, homogeneous arrays and vectors, primitive numeric values, strings,
 bytes, dates and times, Option<T>, decimal values, and Json<T>. An application
 newtype can implement MysqlValue by forwarding to MysqlValueWriter::push.
 
-FromMysqlRow is a derive macro for named structs. Use
-#[mysql(rename = "column_name")] when a field and column differ. Json<T>
+`FromMysqlRow` is the result conversion trait, with a derive macro for named
+business structs. Use `#[mysql(rename = "column_name")]` when a field and column differ. Json<T>
 serializes directly into SQLx's MySQL argument buffer and deserializes directly
 from a JSON column.
+
+### Scalars, tuples and JSON columns
+
+`FromMysqlCol` decodes one column by position. Implementations cover signed and
+unsigned integers, `isize`/`usize`, `f32`/`f64`, `bool`, `String`, `Vec<u8>`,
+Chrono date/time types, decimals, `Json<T>`, `serde_json::Value` and `Option<T>`.
+Every column type also implements `FromMysqlRow` for exactly one column;
+tuples of 1 to 16 column types decode the same number of columns in SELECT order.
+
+```rust,no_run
+use brz_mysql::{FromMysqlCol, Mysql, MysqlResult};
+use serde::Deserialize;
+
+#[derive(Debug, Deserialize, FromMysqlCol)]
+struct Settings {
+    enabled: bool,
+    labels: Vec<String>,
+}
+
+async fn owner_id<M: Mysql>(mysql: &M, task_id: u64) -> MysqlResult<Option<i64>> {
+    mysql.fetch_optional("SELECT user_id FROM tasks WHERE id = ?", (task_id,)).await
+}
+
+async fn user_settings<M: Mysql>(mysql: &M, id: u64)
+    -> MysqlResult<Option<(u64, String, Settings)>>
+{
+    mysql.fetch_optional("SELECT id, name, settings FROM users WHERE id = ?", (id,)).await
+}
+
+async fn settings<M: Mysql>(mysql: &M, id: u64) -> MysqlResult<Option<Settings>> {
+    mysql.fetch_optional("SELECT settings FROM users WHERE id = ?", (id,)).await
+}
+```
+
+Deriving `FromMysqlCol` on a `Deserialize` type decodes one JSON column directly
+into that type, including when it is a tuple element or a field in a struct
+derived with `FromMysqlRow`. Existing `Json<T>` consumers keep the same API.
+Use `FromMysqlRow` to construct a business struct from multiple named columns,
+and `FromMysqlCol` to construct a value from one column. Implementing
+`FromMysqlCol` manually also supports application newtypes through
+`row.get_at::<ExistingType>(index)`.
+
+The outer `Option` from `fetch_optional` denotes row presence. Inner
+`Option<T>` values denote SQL NULL, so one nullable scalar uses
+`Option<Option<T>>`. JSON `null` remains a JSON value when decoded as
+`serde_json::Value`. Missing rows, NULL in a required column, decoding errors,
+and scalar/tuple column-count mismatches retain distinct errors.
+
+`fetch_one`, `fetch_optional`, `fetch_all` and streaming `fetch` share these
+result conversions, including through `M: Mysql`, sharded handles and
+transactions. Existing named `MysqlRow::get`/`get_required` and custom
+`FromMysqlValue` implementations remain supported; `get_at` reads by zero-based
+position, including results with repeated column names.
 
 ## Transactions
 
