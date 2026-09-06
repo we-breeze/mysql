@@ -9,7 +9,9 @@ extern crate self as brz_mysql;
 
 mod api;
 mod arguments;
+mod binary_column;
 mod column;
+mod metrics;
 mod mysql_service;
 mod routed_transaction;
 mod routing;
@@ -21,6 +23,7 @@ pub use api::{
     PoolStats,
 };
 pub use arguments::{Json, MysqlArgs, MysqlRouteValue, MysqlValue, MysqlValueWriter};
+pub use binary_column::BinaryColumn;
 pub use brz_mysql_derive::{FromMysqlCol, FromMysqlRow};
 pub use column::FromMysqlCol;
 pub use mysql_service::{MysqlService, MysqlTransactionService};

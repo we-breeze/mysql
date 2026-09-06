@@ -67,10 +67,36 @@ business structs. Use `#[mysql(rename = "column_name")]` when a field and column
 serializes directly into SQLx's MySQL argument buffer and deserializes directly
 from a JSON column.
 
+### Binary downloads without a payload Vec
+
+`BinaryColumn` is an owned column type sharing SQLx's received row storage.
+It supports scalar results, tuples, derived structs, and streaming `fetch`:
+
+```rust
+use brz_mysql::{BinaryColumn, Mysql, MysqlResult};
+
+async fn load_binary(mysql: &impl Mysql, id: i64) -> MysqlResult<Option<BinaryColumn>> {
+    mysql.fetch_optional(
+        "SELECT binary_data FROM skill_binaries WHERE kind_id = ? LIMIT 1",
+        (id,),
+    ).await
+}
+```
+
+Use `as_bytes()` to borrow the payload, `len()` / `is_empty()` to inspect it,
+and `into_bytes()` to move it into an HTTP response accepting `bytes::Bytes`.
+Cloning and conversion preserve the payload allocation. There is a small
+ownership wrapper allocation, but no intermediate payload `Vec<u8>` or copy.
+The data survives row and connection release and does not hold a pool slot.
+SQLx still buffers the complete row; the shared allocation may retain other
+columns from that row until the response is released. This is not incremental
+BLOB streaming. Use `Option<Option<BinaryColumn>>` with `fetch_optional` when
+both a missing row and a NULL column are possible.
+
 ### Scalars, tuples and JSON columns
 
 `FromMysqlCol` decodes one column by position. Implementations cover `i8` through
-`i64`, `u8` through `u64`, `isize`/`usize`, `f32`/`f64`, `bool`, `String`, `Vec<u8>`,
+`i64`, `u8` through `u64`, `isize`/`usize`, `f32`/`f64`, `bool`, `String`, `Vec<u8>`, `BinaryColumn`,
 Chrono date/time types, decimals, `Json<T>`, `serde_json::Value` and `Option<T>`.
 Every column type also implements `FromMysqlRow` for exactly one column;
 tuples of 1 to 16 column types decode the same number of columns in SELECT order.
@@ -365,3 +391,18 @@ binary rows, and transaction status flags.
 The routing policy affects physical table identifiers only. It does not choose
 a wire protocol or classify API versus process-owned dependencies; those are
 driver and traffic-framework responsibilities respectively.
+
+### MySQL 指标
+
+创建连接池时按 URL 的 host 注册四个 `MYSQL` 指标，不包含端口、数据库、用户名或密码；同一 host 的多个连接池共享计数：
+
+| 指标 | 操作 |
+| --- | --- |
+| `<host>_get` | `fetch_optional`、`fetch_one` |
+| `<host>_list` | `fetch`、`fetch_all` |
+| `<host>_update` | `execute`，包括插入、更新和删除 |
+| `<host>_transaction` | `with_transaction`，从获取事务连接到提交或回滚完成 |
+
+名称只在连接池创建时拼接，查询时使用缓存句柄。计时包含连接等待、SQL 执行和结果解码，沿用资源指标的 50ms 慢调用阈值。事务内语句同时计入各自操作指标；`ping` 不计入。
+
+每次查询计数一次，列表不会按行重复计数。`fetch_optional` 返回 `None` 属于成功，`fetch_one` 的 `RowNotFound` 属于失败。流第一次被 poll 时开始计时，读至结束且没有错误才算成功；开始后提前丢弃的流、取消的调用，以及回滚的事务均记为失败。尚未 poll 的 future/stream 不计数。分片路由在进入底层查询之前发生的解析错误不计入数据库调用指标。

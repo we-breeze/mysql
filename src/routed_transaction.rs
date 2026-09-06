@@ -53,9 +53,8 @@ impl MysqlTransaction for RoutedMysqlTransaction<'_> {
         A: MysqlArgs + Send,
         T: FromMysqlRow + Send,
     {
-        self.fetch_optional(sql, arguments)
-            .await?
-            .ok_or(crate::MysqlError::RowNotFound)
+        let sql = render_query(sql.as_ref(), &arguments, self.routing.as_ref())?;
+        self.transaction.fetch_one(sql, arguments).await
     }
 
     fn fetch<'transaction, S, A, T>(

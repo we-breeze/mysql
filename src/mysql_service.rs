@@ -10,6 +10,8 @@ use sqlx::{
     mysql::{MySqlConnectOptions, MySqlPoolOptions},
 };
 
+use crate::metrics::{MysqlMetrics, Observation};
+
 use crate::{
     FromMysqlRow, Mysql, MysqlArgs, MysqlError, MysqlExecution, MysqlResult, MysqlRouting,
     MysqlRow, MysqlServiceOptions, MysqlTransaction, ShardedMysqlService,
@@ -20,6 +22,7 @@ use crate::{
 #[derive(Clone, Debug)]
 pub struct MysqlService {
     pool: MySqlPool,
+    metrics: MysqlMetrics,
 }
 
 impl MysqlService {
@@ -32,11 +35,12 @@ impl MysqlService {
         options: MysqlServiceOptions,
     ) -> MysqlResult<Self> {
         let (connect_options, pool_options) = build_options(url, &options)?;
+        let metrics = MysqlMetrics::new(connect_options.get_host());
         let pool = pool_options
             .connect_with(connect_options)
             .await
             .map_err(map_sqlx_error)?;
-        Ok(Self { pool })
+        Ok(Self { pool, metrics })
     }
 
     pub fn connect_lazy(url: &str) -> MysqlResult<Self> {
@@ -46,6 +50,7 @@ impl MysqlService {
     pub fn connect_lazy_with_options(url: &str, options: MysqlServiceOptions) -> MysqlResult<Self> {
         let (connect_options, pool_options) = build_options(url, &options)?;
         Ok(Self {
+            metrics: MysqlMetrics::new(connect_options.get_host()),
             pool: pool_options.connect_lazy_with(connect_options),
         })
     }
@@ -60,12 +65,18 @@ impl MysqlService {
         S: AsRef<str> + Send,
         A: MysqlArgs + Send,
     {
-        let (sql, arguments) = prepare_query(sql.as_ref(), arguments, None)?;
-        sqlx::query_with::<MySql, _>(sql.as_ref(), arguments)
-            .execute(&self.pool)
-            .await
-            .map(execution)
-            .map_err(map_sqlx_error)
+        let observation = Observation::new(self.metrics.update);
+        let result = async {
+            let (sql, arguments) = prepare_query(sql.as_ref(), arguments, None)?;
+            sqlx::query_with::<MySql, _>(sql.as_ref(), arguments)
+                .execute(&self.pool)
+                .await
+                .map(execution)
+                .map_err(map_sqlx_error)
+        }
+        .await;
+        observation.finish(result.is_ok());
+        result
     }
 
     pub async fn fetch_optional<S, A, T>(&self, sql: S, arguments: A) -> MysqlResult<Option<T>>
@@ -74,13 +85,19 @@ impl MysqlService {
         A: MysqlArgs + Send,
         T: FromMysqlRow + Send,
     {
-        let (sql, arguments) = prepare_query(sql.as_ref(), arguments, None)?;
-        sqlx::query_with::<MySql, _>(sql.as_ref(), arguments)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(map_sqlx_error)?
-            .map(decode_row)
-            .transpose()
+        let observation = Observation::new(self.metrics.get);
+        let result = async {
+            let (sql, arguments) = prepare_query(sql.as_ref(), arguments, None)?;
+            sqlx::query_with::<MySql, _>(sql.as_ref(), arguments)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(map_sqlx_error)?
+                .map(decode_row)
+                .transpose()
+        }
+        .await;
+        observation.finish(result.is_ok());
+        result
     }
 
     pub async fn fetch_one<S, A, T>(&self, sql: S, arguments: A) -> MysqlResult<T>
@@ -89,9 +106,20 @@ impl MysqlService {
         A: MysqlArgs + Send,
         T: FromMysqlRow + Send,
     {
-        self.fetch_optional(sql, arguments)
-            .await?
-            .ok_or(MysqlError::RowNotFound)
+        let observation = Observation::new(self.metrics.get);
+        let result = async {
+            let (sql, arguments) = prepare_query(sql.as_ref(), arguments, None)?;
+            sqlx::query_with::<MySql, _>(sql.as_ref(), arguments)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(map_sqlx_error)?
+                .map(decode_row)
+                .transpose()?
+                .ok_or(MysqlError::RowNotFound)
+        }
+        .await;
+        observation.finish(result.is_ok());
+        result
     }
 
     /// Lazily fetches and decodes rows with driver-level backpressure.
@@ -106,6 +134,8 @@ impl MysqlService {
         T: FromMysqlRow + Send + 'service,
     {
         stream! {
+            let observation = Observation::new(self.metrics.list);
+            let mut success = true;
             let (sql, arguments) = match prepare_query(
                 sql.as_ref(),
                 arguments,
@@ -120,8 +150,11 @@ impl MysqlService {
             let rows = sqlx::query_with::<MySql, _>(sql.as_ref(), arguments).fetch(&self.pool);
             pin_mut!(rows);
             while let Some(row) = rows.next().await {
-                yield row.map_err(map_sqlx_error).and_then(decode_row);
+                let result = row.map_err(map_sqlx_error).and_then(decode_row);
+                success &= result.is_ok();
+                yield result;
             }
+            observation.finish(success);
         }
     }
 
@@ -164,20 +197,26 @@ impl MysqlService {
             ) -> MysqlResult<T>
             + Send,
     {
-        let mut transaction = self.begin(route).await?;
-        match operation(&mut transaction).await {
-            Ok(value) => {
-                transaction.commit().await?;
-                Ok(value)
+        let observation = Observation::new(self.metrics.transaction);
+        let result = async {
+            let mut transaction = self.begin(route).await?;
+            match operation(&mut transaction).await {
+                Ok(value) => {
+                    transaction.commit().await?;
+                    Ok(value)
+                }
+                Err(operation) => match transaction.rollback().await {
+                    Ok(()) => Err(operation),
+                    Err(rollback) => Err(MysqlError::TransactionRollback {
+                        operation: Box::new(operation),
+                        rollback: Box::new(rollback),
+                    }),
+                },
             }
-            Err(operation) => match transaction.rollback().await {
-                Ok(()) => Err(operation),
-                Err(rollback) => Err(MysqlError::TransactionRollback {
-                    operation: Box::new(operation),
-                    rollback: Box::new(rollback),
-                }),
-            },
         }
+        .await;
+        observation.finish(result.is_ok());
+        result
     }
 
     pub async fn ping(&self) -> MysqlResult<()> {
@@ -206,6 +245,7 @@ impl MysqlService {
             .await
             .map(|inner| MysqlTransactionService {
                 inner: Some(inner),
+                metrics: self.metrics,
                 route,
             })
             .map_err(map_sqlx_error)
@@ -280,6 +320,7 @@ impl Mysql for MysqlService {
 /// Scoped transaction value created only by MysqlService::with_transaction.
 pub struct MysqlTransactionService {
     inner: Option<sqlx::Transaction<'static, MySql>>,
+    metrics: MysqlMetrics,
     route: Option<QueryRouting>,
 }
 
@@ -335,12 +376,18 @@ impl MysqlTransaction for MysqlTransactionService {
         S: AsRef<str> + Send,
         A: MysqlArgs + Send,
     {
-        let (sql, arguments) = prepare_query(sql.as_ref(), arguments, self.route.as_ref())?;
-        sqlx::query_with::<MySql, _>(sql.as_ref(), arguments)
-            .execute(&mut **self.inner()?)
-            .await
-            .map(execution)
-            .map_err(map_sqlx_error)
+        let observation = Observation::new(self.metrics.update);
+        let result = async {
+            let (sql, arguments) = prepare_query(sql.as_ref(), arguments, self.route.as_ref())?;
+            sqlx::query_with::<MySql, _>(sql.as_ref(), arguments)
+                .execute(&mut **self.inner()?)
+                .await
+                .map(execution)
+                .map_err(map_sqlx_error)
+        }
+        .await;
+        observation.finish(result.is_ok());
+        result
     }
 
     async fn fetch_optional<S, A, T>(&mut self, sql: S, arguments: A) -> MysqlResult<Option<T>>
@@ -349,13 +396,19 @@ impl MysqlTransaction for MysqlTransactionService {
         A: MysqlArgs + Send,
         T: FromMysqlRow + Send,
     {
-        let (sql, arguments) = prepare_query(sql.as_ref(), arguments, self.route.as_ref())?;
-        sqlx::query_with::<MySql, _>(sql.as_ref(), arguments)
-            .fetch_optional(&mut **self.inner()?)
-            .await
-            .map_err(map_sqlx_error)?
-            .map(decode_row)
-            .transpose()
+        let observation = Observation::new(self.metrics.get);
+        let result = async {
+            let (sql, arguments) = prepare_query(sql.as_ref(), arguments, self.route.as_ref())?;
+            sqlx::query_with::<MySql, _>(sql.as_ref(), arguments)
+                .fetch_optional(&mut **self.inner()?)
+                .await
+                .map_err(map_sqlx_error)?
+                .map(decode_row)
+                .transpose()
+        }
+        .await;
+        observation.finish(result.is_ok());
+        result
     }
 
     async fn fetch_one<S, A, T>(&mut self, sql: S, arguments: A) -> MysqlResult<T>
@@ -364,9 +417,20 @@ impl MysqlTransaction for MysqlTransactionService {
         A: MysqlArgs + Send,
         T: FromMysqlRow + Send,
     {
-        self.fetch_optional(sql, arguments)
-            .await?
-            .ok_or(MysqlError::RowNotFound)
+        let observation = Observation::new(self.metrics.get);
+        let result = async {
+            let (sql, arguments) = prepare_query(sql.as_ref(), arguments, self.route.as_ref())?;
+            sqlx::query_with::<MySql, _>(sql.as_ref(), arguments)
+                .fetch_optional(&mut **self.inner()?)
+                .await
+                .map_err(map_sqlx_error)?
+                .map(decode_row)
+                .transpose()?
+                .ok_or(MysqlError::RowNotFound)
+        }
+        .await;
+        observation.finish(result.is_ok());
+        result
     }
 
     fn fetch<'transaction, S, A, T>(
@@ -380,6 +444,8 @@ impl MysqlTransaction for MysqlTransactionService {
         T: FromMysqlRow + Send + 'transaction,
     {
         stream! {
+            let observation = Observation::new(self.metrics.list);
+            let mut success = true;
             let (sql, arguments) = match prepare_query(
                 sql.as_ref(),
                 arguments,
@@ -402,8 +468,11 @@ impl MysqlTransaction for MysqlTransactionService {
                 sqlx::query_with::<MySql, _>(sql.as_ref(), arguments).fetch(&mut **transaction);
             pin_mut!(rows);
             while let Some(row) = rows.next().await {
-                yield row.map_err(map_sqlx_error).and_then(decode_row);
+                let result = row.map_err(map_sqlx_error).and_then(decode_row);
+                success &= result.is_ok();
+                yield result;
             }
+            observation.finish(success);
         }
     }
 

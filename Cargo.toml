@@ -6,7 +6,9 @@ description = "Breeze platform MySQL access capability: owns the raw sqlx driver
 
 [dependencies]
 async-stream = "0.3"
+brz-metrics = { package = "metrics", git = "https://github.com/we-breeze/metrics.git", tag = "v0.0.2" }
 brz-mysql-derive = { path = "derive" }
+bytes = "1.9"
 chrono = "0.4"
 futures-core = "0.3"
 futures-util = "0.3"
