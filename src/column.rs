@@ -4,7 +4,7 @@ use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use serde::de::DeserializeOwned;
 use sqlx::{Decode, MySql, Row as _, Type, TypeInfo, ValueRef as _, types::BigDecimal};
 
-use crate::{Json, MysqlError, MysqlResult, MysqlRow};
+use crate::{BinaryColumn, Json, MysqlError, MysqlResult, MysqlRow};
 
 /// Decode one column by its zero-based position directly from the driver buffer.
 ///
@@ -73,6 +73,22 @@ decode_column!("date"; NaiveDate);
 decode_column!("datetime"; NaiveDateTime);
 decode_column!("time"; NaiveTime);
 decode_column!("decimal"; BigDecimal);
+
+impl FromMysqlCol for BinaryColumn {
+    fn from_mysql_col(row: &MysqlRow, index: usize) -> MysqlResult<Self> {
+        // Validate the type and NULL handling exactly as for Vec<u8>, but
+        // borrow its bytes instead of making an owned payload copy.
+        decode::<&[u8]>(row, index, "bytes")?;
+        let value = row
+            .inner
+            .try_get_raw(index)
+            .expect("validated column index");
+        // A value taken directly from MySqlRow shares the row's Bytes storage.
+        Ok(BinaryColumn::from_validated_value(
+            sqlx::ValueRef::to_owned(&value),
+        ))
+    }
+}
 
 impl FromMysqlCol for String {
     fn from_mysql_col(row: &MysqlRow, index: usize) -> MysqlResult<Self> {

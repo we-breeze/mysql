@@ -1,8 +1,8 @@
 #![cfg(feature = "integration-tests")]
 
 use brz_mysql::{
-    FromMysqlCol, FromMysqlRow, FromMysqlValue, Json, Mysql, MysqlError, MysqlResult, MysqlRoute,
-    MysqlRow, MysqlService, MysqlTransaction,
+    BinaryColumn, FromMysqlCol, FromMysqlRow, FromMysqlValue, Json, Mysql, MysqlError, MysqlResult,
+    MysqlRoute, MysqlRow, MysqlService, MysqlTransaction,
 };
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use futures_util::{StreamExt, pin_mut};
@@ -408,6 +408,111 @@ async fn scalar_and_tuple_results_work_through_generic_routing_transactions_and_
     assert_eq!(
         read(&sharded).await.unwrap(),
         vec![(1, "one".into()), (2, "two".into())]
+    );
+    mysql.close().await;
+}
+
+#[tokio::test]
+async fn binary_columns_work_in_scalar_tuple_struct_and_stream_results() {
+    let Some(mysql) = service().await else { return };
+    let scalar: Option<BinaryColumn> = Mysql::fetch_optional(&mysql, "SELECT X'00FF41'", ())
+        .await
+        .unwrap();
+    assert_eq!(scalar.unwrap().as_bytes(), &[0, 255, b'A']);
+    let tuple: (i64, BinaryColumn) = mysql.fetch_one("SELECT 42, X'00FF'", ()).await.unwrap();
+    assert_eq!(tuple.0, 42);
+    assert_eq!(tuple.1.as_bytes(), &[0, 255]);
+    let single: (BinaryColumn,) = mysql.fetch_one("SELECT X'41'", ()).await.unwrap();
+    assert_eq!(single.0.as_bytes(), b"A");
+
+    #[derive(FromMysqlRow)]
+    struct File {
+        #[mysql(rename = "payload")]
+        body: BinaryColumn,
+    }
+    let file: File = mysql
+        .fetch_one("SELECT X'0102' AS payload", ())
+        .await
+        .unwrap();
+    assert_eq!(file.body.as_bytes(), &[1, 2]);
+
+    let all: Vec<BinaryColumn> = mysql
+        .fetch_all("SELECT X'01' UNION ALL SELECT X'02'", ())
+        .await
+        .unwrap();
+    assert_eq!(
+        all.iter().map(BinaryColumn::as_bytes).collect::<Vec<_>>(),
+        [&[1][..], &[2][..]]
+    );
+    let stream =
+        Mysql::fetch::<_, _, BinaryColumn>(&mysql, "SELECT X'03' UNION ALL SELECT X'04'", ());
+    pin_mut!(stream);
+    let first = stream.next().await.unwrap().unwrap();
+    let second = stream.next().await.unwrap().unwrap();
+    assert!(stream.next().await.is_none());
+    assert_eq!((first.as_bytes(), second.as_bytes()), (&[3][..], &[4][..]));
+    let from_transaction: BinaryColumn = mysql
+        .with_transaction(async |transaction| transaction.fetch_one("SELECT X'05'", ()).await)
+        .await
+        .unwrap();
+    mysql.close().await;
+    assert_eq!(from_transaction.into_bytes().as_ref(), &[5]);
+    assert_eq!(file.body.into_bytes().as_ref(), &[1, 2]);
+}
+
+#[tokio::test]
+async fn binary_columns_distinguish_empty_null_missing_and_invalid_results() {
+    let Some(mysql) = service().await else { return };
+    let empty: BinaryColumn = mysql.fetch_one("SELECT X''", ()).await.unwrap();
+    assert!(empty.is_empty());
+    assert_eq!(empty.len(), 0);
+    assert!(empty.into_bytes().is_empty());
+    let missing: Option<BinaryColumn> = mysql
+        .fetch_optional("SELECT X'00' FROM DUAL WHERE FALSE", ())
+        .await
+        .unwrap();
+    assert!(missing.is_none());
+    let null: Option<Option<BinaryColumn>> = mysql.fetch_optional("SELECT NULL", ()).await.unwrap();
+    assert_eq!(null, Some(None));
+    assert_eq!(
+        mysql
+            .fetch_one::<_, _, BinaryColumn>("SELECT NULL AS payload", ())
+            .await
+            .unwrap_err(),
+        MysqlError::UnexpectedNull {
+            column: "payload".into()
+        }
+    );
+    assert!(matches!(
+        mysql
+            .fetch_one::<_, _, BinaryColumn>("SELECT 123", ())
+            .await
+            .unwrap_err(),
+        MysqlError::Decode { .. }
+    ));
+    assert_eq!(
+        mysql
+            .fetch_one::<_, _, BinaryColumn>("SELECT X'01', X'02'", ())
+            .await
+            .unwrap_err(),
+        MysqlError::ColumnCount {
+            expected: 1,
+            actual: 2
+        }
+    );
+    let raw: MysqlRow = mysql
+        .fetch_one("SELECT X'00FF' AS payload", ())
+        .await
+        .unwrap();
+    assert_eq!(
+        raw.get_required::<BinaryColumn>("payload")
+            .unwrap()
+            .as_bytes(),
+        &[0, 255]
+    );
+    assert_eq!(
+        raw.get_at::<BinaryColumn>(1).unwrap_err(),
+        MysqlError::ColumnIndexOutOfBounds { index: 1, len: 1 }
     );
     mysql.close().await;
 }

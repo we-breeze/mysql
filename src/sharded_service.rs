@@ -122,9 +122,9 @@ impl Mysql for ShardedMysqlService {
         A: MysqlArgs + Send,
         T: FromMysqlRow + Send,
     {
-        self.fetch_optional(sql, arguments)
-            .await?
-            .ok_or(crate::MysqlError::RowNotFound)
+        let route = self.routing.resolve(&arguments)?;
+        let sql = render_sql(sql.as_ref(), Some(&route), true)?;
+        self.service.fetch_one(sql, arguments).await
     }
 
     fn fetch<'service, S, A, T>(
