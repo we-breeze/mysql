@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
-IMAGE="${IMAGE:-registry.api.example.com/mysql/mysql:5.7.18}"
+IMAGE="${IMAGE:-mysql:5.7.44}"
 PORT="${PORT:-13307}"
 NAME="brz-mysql-bench-$$"
 

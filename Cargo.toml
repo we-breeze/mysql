@@ -3,11 +3,13 @@ name = "brz-mysql"
 version = "0.1.0"
 edition = "2024"
 description = "Breeze platform MySQL access capability: owns the raw sqlx driver and MySQL connection/pool lifecycle."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/we-breeze/mysql"
 
 [dependencies]
 async-stream = "0.3"
-brz-metrics = { package = "metrics", git = "https://github.com/we-breeze/metrics.git", tag = "v0.0.2" }
-brz-mysql-derive = { path = "derive" }
+brz-metrics = { package = "brz-metrics", version = "0.0.3" }
+brz-mysql-derive = { path = "derive", version = "0.1.0" }
 bytes = "1.9"
 chrono = "0.4"
 futures-core = "0.3"
@@ -20,3 +22,10 @@ tokio = { version = "1", features = ["macros"] }
 
 [features]
 integration-tests = []
+
+[lib]
+name = "brz_mysql"
+
+[workspace]
+members = ["derive", "tools/mysql-bench"]
+resolver = "3"

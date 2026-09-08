@@ -14,7 +14,7 @@ routing within one database; it does not implement database sharding or fanout.
 Pin the release tag used by these examples in the consuming application:
 
 ```toml
-brz-mysql = { git = "https://github.com/we-breeze/mysql.git", tag = "v0.0.3" }
+mysql = { package = "brz-mysql", version = "0.0.5" }
 ```
 
 Repository routing handles replace the earlier global sharding options.
@@ -406,3 +406,15 @@ driver and traffic-framework responsibilities respectively.
 名称只在连接池创建时拼接，查询时使用缓存句柄。计时包含连接等待、SQL 执行和结果解码，沿用资源指标的 50ms 慢调用阈值。事务内语句同时计入各自操作指标；`ping` 不计入。
 
 每次查询计数一次，列表不会按行重复计数。`fetch_optional` 返回 `None` 属于成功，`fetch_one` 的 `RowNotFound` 属于失败。流第一次被 poll 时开始计时，读至结束且没有错误才算成功；开始后提前丢弃的流、取消的调用，以及回滚的事务均记为失败。尚未 poll 的 future/stream 不计数。分片路由在进入底层查询之前发生的解析错误不计入数据库调用指标。
+
+## Releases
+
+CI runs formatting, Clippy, and tests. To publish, open **Actions → Publish → Run workflow** on `main`. Leave `retry_tag` empty to allocate the next `v0.0.x` tag. The workflow validates the code, commits the version, pushes the commit and tag atomically, and publishes to crates.io using the organization secret `CARGO_REGISTRY_TOKEN`.
+
+If publication fails after the tag was pushed, rerun with that existing tag in `retry_tag`. A normal push or pull request does not publish. Historical tags retain their original version numbers; use new release tags for registry packages.
+
+## License
+
+Licensed under either [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
+
+The workflow releases `brz-mysql-derive` before `brz-mysql` at the same version. It verifies the macro package before tagging, then verifies the main package after the macro becomes available in the registry. Retrying skips an uploaded package only when its checksum matches the locally packaged artifact.
