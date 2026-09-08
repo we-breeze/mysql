@@ -102,6 +102,12 @@ mod tests {
         pool.close().await;
         let bytes = cloned.into_bytes();
         assert_eq!(bytes.as_ptr(), pointer);
-        assert!(bytes.chunks_exact(3).all(|chunk| chunk == [0, 255, b'A']));
+        assert!(
+            bytes
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .all(|chunk| *chunk == [0, 255, b'A'])
+        );
     }
 }
