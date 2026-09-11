@@ -497,10 +497,13 @@ async fn custom_keys_and_borrowed_outputs_work_for_queries_joins_streams_and_tra
     let legacy = tasks.route(ByTaskId(17));
     let user = tasks.route(ByUserId(17));
     let new_id = tasks.route(ByTaskId((17 << 37) | 101));
-    let old: ValueRow = legacy
-        .fetch_one("SELECT value FROM {{tasks}} WHERE id = ?", (101_u64,))
-        .await
-        .unwrap();
+    async fn read_by_key<M: Mysql, K: MysqlRouteKey>(mysql: &M, key: K) -> MysqlResult<ValueRow> {
+        mysql
+            .route(key)
+            .fetch_one("SELECT value FROM {{tasks}} WHERE id = ?", (101_u64,))
+            .await
+    }
+    let old = read_by_key(&tasks, ByTaskId(17)).await.unwrap();
     assert_eq!(old.value, "legacy");
     let current: Option<ValueRow> = user
         .fetch_optional("SELECT value FROM {{tasks}} WHERE id = ?", (101_u64,))
