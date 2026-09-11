@@ -290,3 +290,97 @@ async fn single_database_transaction_routes_each_statement_and_rolls_back_all_sh
     }
     mysql.close().await;
 }
+
+#[tokio::test]
+async fn one_sharded_handle_can_mix_plain_tables_and_table_templates() {
+    let Some((mysql, tasks, calls)) = setup("brz_mixed_route_it").await else {
+        return;
+    };
+    tasks.execute(
+        "CREATE TABLE IF NOT EXISTS brz_mixed_route_plain (id BIGINT UNSIGNED PRIMARY KEY, value VARCHAR(64) NOT NULL)",
+        (),
+    ).await.unwrap();
+    tasks
+        .execute("DELETE FROM brz_mixed_route_plain", ())
+        .await
+        .unwrap();
+    tasks
+        .execute(
+            "INSERT INTO brz_mixed_route_plain (id, value) VALUES (101, ?)",
+            ("ordinary",),
+        )
+        .await
+        .unwrap();
+
+    // Both implicit and explicit keys are ignored for plain SQL, including
+    // strings/comments that look like templates. Exercise the generic API too.
+    async fn read_plain<M: Mysql>(mysql: &M) {
+        let row: ValueRow = mysql
+            .fetch_one(
+                "SELECT value FROM brz_mixed_route_plain WHERE value = ? /* {{tasks}} */",
+                ("ordinary",),
+            )
+            .await
+            .unwrap();
+        assert_eq!(row.value, "ordinary");
+        let literal: ValueRow = mysql
+            .fetch_one("SELECT '{{tasks}}' AS value", ())
+            .await
+            .unwrap();
+        assert_eq!(literal.value, "{{tasks}}");
+        let missing: Option<ValueRow> = mysql
+            .fetch_optional(
+                "SELECT value FROM brz_mixed_route_plain WHERE value = ?",
+                ("missing",),
+            )
+            .await
+            .unwrap();
+        assert!(missing.is_none());
+        let all: Vec<ValueRow> = mysql
+            .fetch_all("SELECT value FROM brz_mixed_route_plain", ())
+            .await
+            .unwrap();
+        assert_eq!(
+            all,
+            [ValueRow {
+                value: "ordinary".into()
+            }]
+        );
+        let rows = mysql.fetch::<_, _, ValueRow>("SELECT value FROM brz_mixed_route_plain", ());
+        pin_mut!(rows);
+        assert_eq!(rows.next().await.unwrap().unwrap().value, "ordinary");
+        assert!(rows.next().await.is_none());
+    }
+    read_plain(&tasks).await;
+    read_plain(&tasks.route("not a numeric routing key")).await;
+    tasks
+        .route("unused")
+        .execute(
+            "UPDATE brz_mixed_route_plain SET value = ? WHERE id = 101",
+            ("ordinary",),
+        )
+        .await
+        .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    let joined: ValueRow = tasks.fetch_one(
+        "SELECT p.value FROM {{tasks}} t JOIN brz_mixed_route_plain p ON p.id = t.id WHERE t.uid = ?",
+        (17_u64,),
+    ).await.unwrap();
+    assert_eq!(joined.value, "ordinary");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let explicit: ValueRow = tasks
+        .route(18_u64)
+        .fetch_one("SELECT value FROM {{tasks}} WHERE id = ?", (101_u64,))
+        .await
+        .unwrap();
+    assert_eq!(explicit.value, "original-2");
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+    tasks
+        .execute("DROP TABLE brz_mixed_route_plain", ())
+        .await
+        .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    mysql.close().await;
+}

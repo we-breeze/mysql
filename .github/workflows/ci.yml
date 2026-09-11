@@ -25,3 +25,5 @@ jobs:
       - run: cargo test --workspace --locked
       - run: cargo test --workspace --locked --no-default-features
       - run: cargo test --workspace --locked --release
+      - name: Test against MySQL 5.7
+        run: ./scripts/integration-test.sh

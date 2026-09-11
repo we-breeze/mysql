@@ -2,22 +2,21 @@
 
 use std::sync::Arc;
 
-use async_stream::stream;
 use futures_core::Stream;
 use futures_util::{StreamExt, pin_mut};
 
 use crate::{
     FromMysqlRow, Mysql, MysqlArgs, MysqlExecution, MysqlResult, MysqlRoute, MysqlRouting,
-    MysqlService, MysqlTransactionService, MysqlValue, PoolStats,
-    routing::{invalid, render_sql},
+    MysqlService, MysqlTransactionService, MysqlValue, PoolStats, routing::invalid,
 };
 
 /// Fixed-type handle that a repository can retain. Cloning or rebinding it
 /// shares the underlying pool; dropping it does not close the parent's pool.
 ///
-/// The application policy is evaluated once for each query (on first poll for
-/// a stream) using an explicit key or the first SQL argument. Single-database
-/// transactions resolve table routing separately for each templated statement.
+/// Plain SQL bypasses routing, even when an explicit key is bound. For SQL
+/// containing table templates, the application policy is evaluated once (on
+/// first poll for a stream) using an explicit key or the first SQL argument.
+/// Single-database transactions follow the same per-statement routing rules.
 #[derive(Clone)]
 pub struct ShardedMysqlService {
     service: MysqlService,
@@ -100,9 +99,9 @@ impl Mysql for ShardedMysqlService {
         S: AsRef<str> + Send,
         A: MysqlArgs + Send,
     {
-        let route = self.routing.resolve(&arguments)?;
-        let sql = render_sql(sql.as_ref(), Some(&route), true)?;
-        self.service.execute(sql, arguments).await
+        self.service
+            .execute_with_routing(sql, arguments, Some(&self.routing))
+            .await
     }
 
     async fn fetch_optional<S, A, T>(&self, sql: S, arguments: A) -> MysqlResult<Option<T>>
@@ -111,9 +110,9 @@ impl Mysql for ShardedMysqlService {
         A: MysqlArgs + Send,
         T: FromMysqlRow + Send,
     {
-        let route = self.routing.resolve(&arguments)?;
-        let sql = render_sql(sql.as_ref(), Some(&route), true)?;
-        self.service.fetch_optional(sql, arguments).await
+        self.service
+            .fetch_optional_with_routing(sql, arguments, Some(&self.routing))
+            .await
     }
 
     async fn fetch_one<S, A, T>(&self, sql: S, arguments: A) -> MysqlResult<T>
@@ -122,9 +121,9 @@ impl Mysql for ShardedMysqlService {
         A: MysqlArgs + Send,
         T: FromMysqlRow + Send,
     {
-        let route = self.routing.resolve(&arguments)?;
-        let sql = render_sql(sql.as_ref(), Some(&route), true)?;
-        self.service.fetch_one(sql, arguments).await
+        self.service
+            .fetch_one_with_routing(sql, arguments, Some(&self.routing))
+            .await
     }
 
     fn fetch<'service, S, A, T>(
@@ -137,22 +136,8 @@ impl Mysql for ShardedMysqlService {
         A: MysqlArgs + Send + 'service,
         T: FromMysqlRow + Send + 'service,
     {
-        stream! {
-            let rendered = self.routing.resolve(&arguments)
-                .and_then(|route| render_sql(sql.as_ref(), Some(&route), true));
-            let sql = match rendered {
-                Ok(sql) => sql,
-                Err(error) => {
-                    yield Err(error);
-                    return;
-                }
-            };
-            let rows = self.service.fetch(sql, arguments);
-            pin_mut!(rows);
-            while let Some(row) = rows.next().await {
-                yield row;
-            }
-        }
+        self.service
+            .fetch_with_routing(sql, arguments, Some(&self.routing))
     }
 
     async fn fetch_all<S, A, T>(&self, sql: S, arguments: A) -> MysqlResult<Vec<T>>
@@ -193,6 +178,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn plain_queries_bypass_routing_for_every_query_method() {
+        let mysql = lazy();
+        let tasks = mysql.with_route(|_: MysqlRouteValue<'_>| {
+            panic!("plain SQL must not invoke the routing policy")
+        });
+        // A closed pool lets every query reach the driver without a database.
+        mysql.close().await;
+        for handle in [tasks.clone(), tasks.route("unused key")] {
+            for sql in [
+                "SELECT ? AS value",
+                "SELECT ? AS value, '{{tasks}}' AS literal /* {{ignored}} */",
+            ] {
+                let rendered = crate::mysql_service::render_query(
+                    sql,
+                    &("not a routing key",),
+                    Some(&handle.routing),
+                )
+                .unwrap();
+                assert!(matches!(rendered, std::borrow::Cow::Borrowed(_)));
+                assert_eq!(rendered, sql);
+
+                let results = [
+                    handle.execute(sql, ("value",)).await.map(|_| ()),
+                    handle
+                        .fetch_one::<_, _, String>(sql, ("value",))
+                        .await
+                        .map(|_| ()),
+                    handle
+                        .fetch_optional::<_, _, String>(sql, ("value",))
+                        .await
+                        .map(|_| ()),
+                    handle
+                        .fetch_all::<_, _, String>(sql, ("value",))
+                        .await
+                        .map(|_| ()),
+                ];
+                for result in results {
+                    assert!(matches!(result, Err(MysqlError::Database { .. })));
+                }
+                let rows = handle.fetch::<_, _, String>(sql, ("value",));
+                pin_mut!(rows);
+                assert!(matches!(
+                    rows.next().await,
+                    Some(Err(MysqlError::Database { .. }))
+                ));
+                assert!(rows.next().await.is_none());
+            }
+            // No argument is required when there is no template.
+            assert!(matches!(
+                handle.execute("DELETE FROM config", ()).await,
+                Err(MysqlError::Database { .. })
+            ));
+        }
+    }
+
+    #[tokio::test]
     async fn invalid_routes_fail_before_connecting_and_streams_resolve_only_when_polled() {
         let mysql = lazy();
         let calls = Arc::new(AtomicUsize::new(0));
@@ -215,13 +256,6 @@ mod tests {
             tasks
                 .route(17_u64)
                 .execute("DELETE FROM {{unknown}} WHERE id = ?", ("not a uid",))
-                .await
-                .is_err()
-        );
-        assert!(
-            tasks
-                .route(17_u64)
-                .execute("DELETE FROM tasks", ())
                 .await
                 .is_err()
         );

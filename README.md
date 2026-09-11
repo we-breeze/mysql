@@ -258,15 +258,25 @@ same repository. `with_route` on an existing sharded handle replaces the policy
 and clears any explicit key. Policies and retained keys must be owned/static;
 shared application configuration can be held in an `Arc`.
 
-Ordinary queries continue through `mysql.fetch_one(sql, args)` without calling
-any policy. A sharded query requires at least one table template and a routing
-key. Missing keys, rejected key types, missing template mappings, and invalid
-identifiers fail before the query acquires a connection. A policy receives a
-`MysqlRouteValue` and owns the meaning of that value: the component does not
-infer whether a number represents a user id or an encoded task id.
+Ordinary queries can use either the parent `MysqlService` or the same
+`ShardedMysqlService`: SQL without table templates executes directly, without
+reading a routing key or calling the policy, even if `.route(key)` is bound.
+The shared query preparation path reuses the existing template check; ordinary
+SQL is borrowed without copying or an additional scan in the sharded handle.
+Template-looking text inside string literals or ordinary comments does not
+trigger routing. A query can join a templated table with an ordinary table;
+only the templates are replaced.
 
-The policy is evaluated once per query; `fetch` evaluates it only when the stream
-is first polled. Closures implementing
+SQL containing table templates requires a routing key. Missing keys, rejected
+key types, missing template mappings, and invalid identifiers fail before the
+query acquires a connection. Forgetting a template no longer raises a client
+error: the SQL uses the table name as written, which can succeed if that table
+exists. A policy receives a `MysqlRouteValue` and owns the meaning of that
+value: the component does not infer whether a number represents a user id or
+an encoded task id.
+
+For templated SQL, the policy is evaluated once per query; `fetch` evaluates it
+only when the stream is first polled. Closures implementing
 `Fn(MysqlRouteValue<'_>) -> MysqlResult<MysqlRoute>` are supported as policies.
 Custom `MysqlValue` implementations can expose their default routing key through
 `route_value`; custom `MysqlArgs` can implement `first_route_value`. These methods
