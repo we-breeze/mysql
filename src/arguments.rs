@@ -9,7 +9,8 @@ use sqlx::{
 
 use crate::{MysqlError, MysqlResult};
 
-/// A borrowed, allocation-free view of an explicit or first-argument routing key.
+/// A borrowed, allocation-free view of the first SQL argument for implicit routing.
+/// Explicit keys preserve their original type through `MysqlRouteKey` instead.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum MysqlRouteValue<'a> {
     Null,
@@ -53,6 +54,59 @@ impl<'value> MysqlRouteValue<'value> {
         match self {
             Self::Bytes(value) => Ok(value),
             _ => Err(route_type_error("bytes")),
+        }
+    }
+}
+
+// Adapt borrowed SQL values to the owned/static key contract only if a real
+// template needs implicit routing. Numeric values stay inline; strings/bytes
+// are copied once per statement, never for plain SQL or explicit keys.
+pub(crate) enum ArgumentRouteKey {
+    Null,
+    String(String),
+    Bytes(Vec<u8>),
+    Bool(bool),
+    I64(i64),
+    U64(u64),
+    F64(f64),
+    Date(NaiveDate),
+    DateTime(NaiveDateTime),
+    Time(NaiveTime),
+}
+
+impl ArgumentRouteKey {
+    pub(crate) fn new(value: MysqlRouteValue<'_>) -> MysqlResult<Self> {
+        Ok(match value {
+            MysqlRouteValue::Null => Self::Null,
+            MysqlRouteValue::String(value) => Self::String(value.to_owned()),
+            MysqlRouteValue::Bytes(value) => Self::Bytes(value.to_vec()),
+            MysqlRouteValue::Bool(value) => Self::Bool(value),
+            MysqlRouteValue::I64(value) => Self::I64(value),
+            MysqlRouteValue::U64(value) => Self::U64(value),
+            MysqlRouteValue::F64(value) => Self::F64(value),
+            MysqlRouteValue::Date(value) => Self::Date(value),
+            MysqlRouteValue::DateTime(value) => Self::DateTime(value),
+            MysqlRouteValue::Time(value) => Self::Time(value),
+            MysqlRouteValue::Unsupported(_) => {
+                return Err(crate::routing::invalid(
+                    "first SQL argument cannot be used as a routing key; use .route(key)",
+                ));
+            }
+        })
+    }
+
+    pub(crate) fn as_key(&self) -> &dyn crate::MysqlRouteKey {
+        match self {
+            Self::Null => &(),
+            Self::String(value) => value,
+            Self::Bytes(value) => value,
+            Self::Bool(value) => value,
+            Self::I64(value) => value,
+            Self::U64(value) => value,
+            Self::F64(value) => value,
+            Self::Date(value) => value,
+            Self::DateTime(value) => value,
+            Self::Time(value) => value,
         }
     }
 }

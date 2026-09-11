@@ -6,16 +6,18 @@ use futures_core::Stream;
 use futures_util::{StreamExt, pin_mut};
 
 use crate::{
-    FromMysqlRow, Mysql, MysqlArgs, MysqlExecution, MysqlResult, MysqlRoute, MysqlRouting,
-    MysqlService, MysqlTransactionService, MysqlValue, PoolStats, routing::invalid,
+    FromMysqlRow, Mysql, MysqlArgs, MysqlExecution, MysqlResult, MysqlRouteKey, MysqlRouting,
+    MysqlService, MysqlTransactionService, PoolStats,
+    arguments::ArgumentRouteKey,
+    routing::{RouteRenderer, invalid},
 };
 
 /// Fixed-type handle that a repository can retain. Cloning or rebinding it
 /// shares the underlying pool; dropping it does not close the parent's pool.
 ///
 /// Plain SQL bypasses routing, even when an explicit key is bound. For SQL
-/// containing table templates, the application policy is evaluated once (on
-/// first poll for a stream) using an explicit key or the first SQL argument.
+/// containing table templates, the policy is evaluated once per distinct name
+/// (on first poll for a stream), with the explicit key or first SQL argument.
 /// Single-database transactions follow the same per-statement routing rules.
 #[derive(Clone)]
 pub struct ShardedMysqlService {
@@ -25,26 +27,38 @@ pub struct ShardedMysqlService {
 
 #[derive(Clone)]
 pub(crate) struct QueryRouting {
-    policy: Arc<dyn MysqlRouting>,
-    key: Option<Arc<dyn MysqlValue + Sync>>,
+    policy: Arc<dyn RouteRenderer>,
+    key: Option<Arc<dyn MysqlRouteKey>>,
 }
 
 impl QueryRouting {
-    pub(crate) fn with_key<K: MysqlValue + Sync + 'static>(&self, key: K) -> Self {
+    pub(crate) fn with_key<K: MysqlRouteKey>(&self, key: K) -> Self {
         Self {
             policy: self.policy.clone(),
             key: Some(Arc::new(key)),
         }
     }
 
-    pub(crate) fn resolve<A: MysqlArgs>(&self, arguments: &A) -> MysqlResult<MysqlRoute> {
+    pub(crate) fn render_template<A: MysqlArgs>(
+        &self,
+        template: &str,
+        arguments: &A,
+        implicit_key: &mut Option<ArgumentRouteKey>,
+        out: &mut dyn std::fmt::Write,
+    ) -> MysqlResult<()> {
         let key = match &self.key {
-            Some(key) => key.route_value(),
-            None => arguments.first_route_value().ok_or_else(|| {
-                invalid("sharded queries require .route(key) or a first SQL argument")
-            })?,
+            Some(key) => key.as_ref(),
+            None => {
+                if implicit_key.is_none() {
+                    let value = arguments.first_route_value().ok_or_else(|| {
+                        invalid("sharded queries require .route(key) or a first SQL argument")
+                    })?;
+                    *implicit_key = Some(ArgumentRouteKey::new(value)?);
+                }
+                implicit_key.as_ref().unwrap().as_key()
+            }
         };
-        self.policy.resolve(key)
+        self.policy.render(template, key, out)
     }
 }
 
@@ -75,7 +89,7 @@ impl ShardedMysqlService {
     /// Bind an explicit key on an independent handle. The original handle
     /// remains unchanged, so it can serve concurrent users. The key is never
     /// encoded as a SQL argument. Pass owned keys when retaining the handle.
-    pub fn route<K: MysqlValue + Sync + 'static>(&self, key: K) -> Self {
+    pub fn route<K: MysqlRouteKey>(&self, key: K) -> Self {
         Self {
             service: self.service.clone(),
             routing: self.routing.with_key(key),
@@ -170,7 +184,7 @@ impl Mysql for ShardedMysqlService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{MysqlError, MysqlRouteValue};
+    use crate::MysqlError;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn lazy() -> MysqlService {
@@ -178,9 +192,255 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn results_borrow_policy_template_and_key_and_write_only_once() {
+        use crate::MysqlRouteOutput;
+        struct Key(u64);
+        struct Policy {
+            prefix: String,
+            writes: Arc<AtomicUsize>,
+        }
+        struct Output<'a> {
+            prefix: &'a str,
+            template: &'a str,
+            id: &'a u64,
+            writes: &'a AtomicUsize,
+        }
+        impl MysqlRouteOutput for Output<'_> {
+            fn write_to(&self, out: &mut dyn std::fmt::Write) -> std::fmt::Result {
+                self.writes.fetch_add(1, Ordering::SeqCst);
+                write!(out, "{}_{}_{:04}", self.prefix, self.template, self.id)
+            }
+        }
+        impl MysqlRouting for Policy {
+            fn resolve<'a>(
+                &'a self,
+                template: &'a str,
+                key: &'a dyn MysqlRouteKey,
+            ) -> MysqlResult<impl MysqlRouteOutput + 'a> {
+                let key = key
+                    .downcast_ref::<Key>()
+                    .ok_or_else(|| invalid("expected Key"))?;
+                Ok(Output {
+                    prefix: &self.prefix,
+                    template,
+                    id: &key.0,
+                    writes: &self.writes,
+                })
+            }
+        }
+        let mysql = lazy();
+        let writes = Arc::new(AtomicUsize::new(0));
+        let routed = mysql
+            .with_route(Policy {
+                prefix: "app".into(),
+                writes: writes.clone(),
+            })
+            .route(Key(509));
+        let sql = "SELECT * FROM {{tasks}} JOIN {{subtasks}} JOIN {{tasks}}";
+        assert_eq!(
+            crate::mysql_service::render_query(sql, &(), Some(&routed.routing)).unwrap(),
+            "SELECT * FROM `app_tasks_0509` JOIN `app_subtasks_0509` JOIN `app_tasks_0509`"
+        );
+        assert_eq!(writes.load(Ordering::SeqCst), 2);
+
+        struct BorrowKey;
+        impl MysqlRouting for BorrowKey {
+            fn resolve<'a>(
+                &'a self,
+                _: &'a str,
+                key: &'a dyn MysqlRouteKey,
+            ) -> MysqlResult<impl MysqlRouteOutput + 'a> {
+                key.as_str()
+            }
+        }
+        let borrowed = mysql.with_route(BorrowKey).route(String::from("tasks"));
+        assert_eq!(
+            crate::mysql_service::render_query(
+                "SELECT * FROM {{table}}",
+                &(),
+                Some(&borrowed.routing)
+            )
+            .unwrap(),
+            "SELECT * FROM `tasks`"
+        );
+        let number = mysql
+            .with_route(|_: &str, _: &dyn MysqlRouteKey| Ok(509_u64))
+            .route(());
+        assert_eq!(
+            crate::mysql_service::render_query(
+                "SELECT * FROM tasks_{{slot}}",
+                &(),
+                Some(&number.routing)
+            )
+            .unwrap(),
+            "SELECT * FROM `tasks_509`"
+        );
+        mysql.close().await;
+    }
+
+    #[tokio::test]
+    async fn output_errors_and_ignored_writer_errors_fail_before_connecting() {
+        use crate::MysqlRouteOutput;
+        struct BrokenOutput {
+            ignore_error: bool,
+        }
+        impl MysqlRouteOutput for BrokenOutput {
+            fn write_to(&self, out: &mut dyn std::fmt::Write) -> std::fmt::Result {
+                out.write_str("tasks")?;
+                if self.ignore_error {
+                    let _ = out.write_str("; DROP TABLE users");
+                    Ok(())
+                } else {
+                    Err(std::fmt::Error)
+                }
+            }
+        }
+        let mysql = lazy();
+        for ignore_error in [false, true] {
+            let routed = mysql
+                .with_route(move |_: &str, _: &dyn MysqlRouteKey| Ok(BrokenOutput { ignore_error }))
+                .route(());
+            assert!(matches!(
+                routed.execute("DELETE FROM {{tasks}}", ()).await,
+                Err(MysqlError::InvalidQuery { .. })
+            ));
+        }
+        let empty = mysql
+            .with_route(|_: &str, _: &dyn MysqlRouteKey| Ok(""))
+            .route(());
+        assert!(matches!(
+            empty.execute("DELETE FROM {{tasks}}", ()).await,
+            Err(MysqlError::InvalidQuery { .. })
+        ));
+        assert_eq!(mysql.pool_stats().size, 0);
+        mysql.close().await;
+    }
+
+    #[tokio::test]
+    async fn custom_key_types_keep_business_meaning_without_sql_encoding() {
+        // Neither type implements MysqlValue or Clone.
+        struct ByTaskId(u64);
+        struct ByUserId(u64);
+        let mysql = lazy();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let tasks = mysql.with_route(move |template: &str, key: &dyn MysqlRouteKey| {
+            count.fetch_add(1, Ordering::SeqCst);
+            if let Some(ByTaskId(id)) = key.downcast_ref::<ByTaskId>() {
+                return Ok(if *id < (1 << 37) {
+                    template.to_owned()
+                } else {
+                    format!("{template}_{:04}", (id >> 37) % 1024)
+                });
+            }
+            let uid = key
+                .downcast_ref::<ByUserId>()
+                .ok_or_else(|| invalid("expected ByTaskId or ByUserId"))?
+                .0;
+            Ok(format!("{template}_{:04}", uid % 1024))
+        });
+        let sql = "SELECT * FROM {{tasks}} a JOIN {{subtasks}} b JOIN {{tasks}} c";
+        for (handle, expected) in [
+            (
+                tasks.route(ByTaskId(509)),
+                "SELECT * FROM `tasks` a JOIN `subtasks` b JOIN `tasks` c",
+            ),
+            (
+                tasks.route(ByUserId(509)),
+                "SELECT * FROM `tasks_0509` a JOIN `subtasks_0509` b JOIN `tasks_0509` c",
+            ),
+            (
+                tasks.route(ByTaskId((509 << 37) | 123)),
+                "SELECT * FROM `tasks_0509` a JOIN `subtasks_0509` b JOIN `tasks_0509` c",
+            ),
+        ] {
+            let before = calls.load(Ordering::SeqCst);
+            // Cloning a handle shares the opaque key. SQL arguments are independent.
+            let cloned = handle.clone();
+            drop(handle);
+            let rendered =
+                crate::mysql_service::render_query(sql, &("not the key",), Some(&cloned.routing))
+                    .unwrap();
+            assert_eq!(rendered, expected);
+            assert_eq!(calls.load(Ordering::SeqCst), before + 2);
+        }
+        let invalid_key = tasks.route(509_u64);
+        assert!(crate::mysql_service::render_query(sql, &(), Some(&invalid_key.routing)).is_err());
+        assert!(crate::mysql_service::render_query(sql, &(), Some(&tasks.routing)).is_err());
+        // Rebinding clears the previous explicit key and uses the new policy.
+        let rebound =
+            tasks
+                .route(ByUserId(509))
+                .with_route(|name: &str, key: &dyn MysqlRouteKey| {
+                    Ok(format!("{name}_{:04}", key.as_u64()?))
+                });
+        assert_eq!(
+            crate::mysql_service::render_query(
+                "SELECT * FROM {{tasks}}",
+                &(2_u8,),
+                Some(&rebound.routing)
+            )
+            .unwrap(),
+            "SELECT * FROM `tasks_0002`"
+        );
+        assert_eq!(mysql.pool_stats().size, 0);
+        mysql.close().await;
+    }
+
+    #[tokio::test]
+    async fn implicit_borrowed_keys_are_adapted_once_and_plain_sql_does_not_read_them() {
+        use crate::{MysqlRouteValue, MysqlValueWriter};
+        struct Args<'a> {
+            value: &'a str,
+            reads: &'a AtomicUsize,
+        }
+        impl MysqlArgs for Args<'_> {
+            fn len(&self) -> usize {
+                1
+            }
+            fn encoded_size_hint(&self) -> usize {
+                self.value.len() + 9
+            }
+            fn first_route_value(&self) -> Option<MysqlRouteValue<'_>> {
+                self.reads.fetch_add(1, Ordering::SeqCst);
+                Some(MysqlRouteValue::String(self.value))
+            }
+            fn write(self, writer: &mut MysqlValueWriter) -> MysqlResult<()> {
+                writer.push(self.value)
+            }
+        }
+        let mysql = lazy();
+        let tasks = mysql.with_route(|template: &str, key: &dyn MysqlRouteKey| {
+            Ok(format!("{template}_{}", key.as_str()?))
+        });
+        let text = String::from("tenant");
+        let reads = AtomicUsize::new(0);
+        let args = Args {
+            value: text.as_str(),
+            reads: &reads,
+        };
+        let sql = "SELECT * FROM {{tasks}} JOIN {{subtasks}} JOIN {{tasks}}";
+        assert_eq!(
+            crate::mysql_service::render_query(sql, &args, Some(&tasks.routing)).unwrap(),
+            "SELECT * FROM `tasks_tenant` JOIN `subtasks_tenant` JOIN `tasks_tenant`"
+        );
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+        let plain = "SELECT '{{tasks}}' /* {{subtasks}} */";
+        assert_eq!(
+            crate::mysql_service::render_query(plain, &args, Some(&tasks.routing)).unwrap(),
+            plain
+        );
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+        let explicit = tasks.route(String::from("other"));
+        assert!(crate::mysql_service::render_query(sql, &args, Some(&explicit.routing)).is_ok());
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+        mysql.close().await;
+    }
+
+    #[tokio::test]
     async fn plain_queries_bypass_routing_for_every_query_method() {
         let mysql = lazy();
-        let tasks = mysql.with_route(|_: MysqlRouteValue<'_>| {
+        let tasks = mysql.with_route(|_: &str, _: &dyn MysqlRouteKey| -> MysqlResult<&str> {
             panic!("plain SQL must not invoke the routing policy")
         });
         // A closed pool lets every query reach the driver without a database.
@@ -238,9 +498,12 @@ mod tests {
         let mysql = lazy();
         let calls = Arc::new(AtomicUsize::new(0));
         let count = calls.clone();
-        let tasks = mysql.with_route(move |key: MysqlRouteValue<'_>| {
+        let tasks = mysql.with_route(move |template: &str, key: &dyn MysqlRouteKey| {
             count.fetch_add(1, Ordering::SeqCst);
-            MysqlRoute::new().with_table("tasks", format!("tasks_{:04}", key.as_u64()? % 16))
+            if template != "tasks" {
+                return Err(invalid("unknown template"));
+            }
+            Ok(format!("tasks_{:04}", key.as_u64()? % 16))
         });
 
         assert!(tasks.execute("DELETE FROM {{tasks}}", ()).await.is_err());

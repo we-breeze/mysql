@@ -3,8 +3,8 @@
 use std::time::Duration;
 
 use brz_mysql::{
-    FromMysqlRow, Json, Mysql, MysqlError, MysqlResult, MysqlRoute, MysqlRouteValue, MysqlRow,
-    MysqlService, MysqlServiceOptions, MysqlTransaction,
+    FromMysqlRow, Json, Mysql, MysqlError, MysqlResult, MysqlRouteKey, MysqlRow, MysqlService,
+    MysqlServiceOptions, MysqlTransaction,
 };
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use futures_util::{StreamExt, pin_mut};
@@ -346,9 +346,10 @@ async fn routed_service_uses_first_argument_without_rebinding_it() {
             .unwrap();
     }
 
-    let routed = plain.with_route(|key: MysqlRouteValue<'_>| {
+    let routed = plain.with_route(|template: &str, key: &dyn MysqlRouteKey| {
         let suffix = format!("{:04}", key.as_u64()? % 16);
-        MysqlRoute::new().with_table("brz_mysql_route_it", format!("brz_mysql_route_it_{suffix}"))
+        assert_eq!(template, "brz_mysql_route_it");
+        Ok(format!("brz_mysql_route_it_{suffix}"))
     });
 
     routed

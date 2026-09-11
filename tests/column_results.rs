@@ -2,7 +2,7 @@
 
 use brz_mysql::{
     BinaryColumn, FromMysqlCol, FromMysqlRow, FromMysqlValue, Json, Mysql, MysqlError, MysqlResult,
-    MysqlRoute, MysqlRow, MysqlService, MysqlTransaction,
+    MysqlRouteKey, MysqlRow, MysqlService, MysqlTransaction,
 };
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use futures_util::{StreamExt, pin_mut};
@@ -378,8 +378,9 @@ async fn scalar_and_tuple_results_work_through_generic_routing_transactions_and_
         )
         .await
         .unwrap();
-    let sharded = mysql.with_route(|_: brz_mysql::MysqlRouteValue<'_>| {
-        MysqlRoute::new().with_table("records", "brz_mysql_column_route")
+    let sharded = mysql.with_route(|template: &str, _: &dyn MysqlRouteKey| {
+        assert_eq!(template, "records");
+        Ok("brz_mysql_column_route")
     });
     async fn read<M: Mysql>(mysql: &M) -> MysqlResult<Vec<(i64, String)>> {
         let id: Option<i64> = mysql

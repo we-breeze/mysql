@@ -208,107 +208,144 @@ without policy type parameters or borrowing the parent service. All handles
 share the parent's pool. `MysqlServiceOptions` contains only pool/session
 settings; routing does not change global service configuration.
 
+A policy receives the current template name and a key, and returns a lightweight
+`MysqlRouteOutput`. The component calls `write_to` to write it directly into the
+SQL buffer. All `Display` types (including strings and numbers) implement
+`MysqlRouteOutput` automatically; custom result objects can implement it directly.
+
 ```rust
 use brz_mysql::{
-    Mysql, MysqlResult, MysqlRoute, MysqlRouteValue, MysqlRouting,
-    MysqlService, ShardedMysqlService,
+    Mysql, MysqlError, MysqlResult, MysqlRouteKey, MysqlRouteOutput,
+    MysqlRouting, MysqlService,
 };
 
-struct TaskRouting {
-    shard_count: u64, // validated as nonzero when loading application config
-}
+// Business types need no SQL encoding or Clone implementation.
+struct ByTaskId(u64);
+struct ByUserId(u64);
 
-impl MysqlRouting for TaskRouting {
-    fn resolve(&self, key: MysqlRouteValue<'_>) -> MysqlResult<MysqlRoute> {
-        let uid = key.as_u64()?;
-        let suffix = format!("{:04}", uid % self.shard_count);
-        MysqlRoute::new()
-            .with_table_suffix(&suffix)?
-            .with_table("tasks", format!("tasks_{suffix}"))?
-            .with_table("subtasks", format!("subtasks_{suffix}"))
+struct TaskRouting { shard_count: u64 } // validate as nonzero in application config
+struct TableName<'a> { prefix: &'a str, slot: Option<u64> }
+
+impl MysqlRouteOutput for TableName<'_> {
+    fn write_to(&self, out: &mut dyn std::fmt::Write) -> std::fmt::Result {
+        out.write_str(self.prefix)?;
+        if let Some(slot) = self.slot {
+            write!(out, "_{slot:04}")?;
+        }
+        Ok(())
     }
 }
 
-struct TaskRepository {
-    mysql: ShardedMysqlService,
+impl MysqlRouting for TaskRouting {
+    fn resolve<'a>(
+        &'a self,
+        template: &'a str,
+        key: &'a dyn MysqlRouteKey,
+    ) -> MysqlResult<impl MysqlRouteOutput + 'a> {
+        if !matches!(template, "tasks" | "subtasks") {
+            return Err(MysqlError::InvalidQuery {
+                reason: format!("unknown template: {template}"),
+            });
+        }
+        // Example business rules, not built into the MySQL component.
+        let uid = if let Some(ByTaskId(id)) = key.downcast_ref::<ByTaskId>() {
+            if *id < (1 << 37) { None } else { Some((id >> 37) & 0xffff) }
+        } else if let Some(ByUserId(uid)) = key.downcast_ref::<ByUserId>() {
+            Some(*uid)
+        } else {
+            Some(key.as_u64()?) // allow numeric first-SQL-argument fallback
+        };
+        Ok(TableName {
+            prefix: template,
+            slot: uid.map(|uid| uid % self.shard_count),
+        })
+    }
 }
 
 let mysql = MysqlService::connect(database_url).await?;
-let repository = TaskRepository {
-    mysql: mysql.with_route(TaskRouting { shard_count: 1024 }),
-};
+let tasks = mysql.with_route(TaskRouting { shard_count: 1024 });
 
-// No explicit routing key: uid is the first SQL argument and is also bound to ?.
-let task: Task = repository.mysql.fetch_one(
-    "SELECT id, title, config, deleted_at FROM {{tasks}} WHERE user_id = ? AND id = ?",
-    (uid, task_id),
-).await?;
+// The same number has different meanings and selects different tables.
+tasks.route(ByTaskId(509)).execute(
+    "DELETE FROM {{tasks}} WHERE id = ?", (509_u64,),
+).await?; // tasks, for the example's legacy task ID rule
 
-// Explicit key: uid selects the table; title remains the first SQL argument.
-repository.mysql.route(uid).execute(
-    "UPDATE tasks_{{table_suffix}} SET title = ? WHERE id = ?",
-    (title, task_id),
-).await?;
+tasks.route(ByUserId(509)).execute(
+    "DELETE FROM {{tasks}} WHERE user_id = ?", (509_u64,),
+).await?; // tasks_0509
+
+// No explicit key: the first argument selects the table and remains bound to ?.
+tasks.execute("DELETE FROM {{tasks}} WHERE user_id = ?", (509_u64,)).await?;
 ```
 
-The key precedence is **explicit `.route(key)` > first SQL argument**. An
-explicit key is never added to the bound arguments. Creating a keyed handle
-does not mutate the repository's handle; concurrent users can safely share the
-same repository. `with_route` on an existing sharded handle replaces the policy
-and clears any explicit key. Policies and retained keys must be owned/static;
-shared application configuration can be held in an `Arc`.
+`MysqlRouteKey` is an empty marker trait, automatically implemented for every
+`Any + Send + Sync` type. `.route(key)` retains the original concrete type in an
+`Arc`; strategies inspect it with `downcast_ref::<T>()`. The key never needs to
+implement `MysqlValue`. Helpers `as_u64`, `as_i64`, `as_str`, and `as_bytes` support
+ordinary integer/string/byte keys without parsing or truncating values.
+Explicit `Option<T>` and newtypes retain their original type; their semantics
+belong to the policy. Dynamic strings must be owned, not borrowed from locals.
 
-Ordinary queries can use either the parent `MysqlService` or the same
-`ShardedMysqlService`: SQL without table templates executes directly, without
-reading a routing key or calling the policy, even if `.route(key)` is bound.
-The shared query preparation path reuses the existing template check; ordinary
-SQL is borrowed without copying or an additional scan in the sharded handle.
-Template-looking text inside string literals or ordinary comments does not
-trigger routing. A query can join a templated table with an ordinary table;
-only the templates are replaced.
+The key precedence remains **explicit `.route(key)` > first SQL argument**.
+An explicit key is never added to bound arguments. Binding a key does not change
+the original handle; cloning shares its policy, key and pool. `with_route` on an
+existing handle replaces the policy and clears its explicit key.
 
-SQL containing table templates requires a routing key. Missing keys, rejected
-key types, missing template mappings, and invalid identifiers fail before the
-query acquires a connection. Forgetting a template no longer raises a client
-error: the SQL uses the table name as written, which can succeed if that table
-exists. A policy receives a `MysqlRouteValue` and owns the meaning of that
-value: the component does not infer whether a number represents a user id or
-an encoded task id.
+The implicit first-argument path still uses `MysqlValue::route_value()` and
+`MysqlArgs::first_route_value()`. It adapts values once per templated statement:
+integers become `i64`/`u64`, floats become `f64`, booleans and chrono values retain
+their corresponding types, and NULL becomes `()`. Borrowed strings/bytes are
+copied once to `String`/`Vec<u8>` to satisfy the `Any` contract; they remain usable
+as SQL parameters. Unsupported values require an explicit `.route(key)`.
+No adaptation runs for plain SQL or when an explicit key is present.
 
-For templated SQL, the policy is evaluated once per query; `fetch` evaluates it
-only when the stream is first polled. Closures implementing
-`Fn(MysqlRouteValue<'_>) -> MysqlResult<MysqlRoute>` are supported as policies.
-Custom `MysqlValue` implementations can expose their default routing key through
-`route_value`; custom `MysqlArgs` can implement `first_route_value`. These methods
-are not used by ordinary queries.
+Ordinary SQL can use either the parent `MysqlService` or the same sharded handle.
+SQL without templates bypasses key extraction and the policy, even with an
+explicit key. It reuses the existing template check and borrows the original SQL
+without copying. Forgetting a template executes the table name as written,
+which can succeed if that table exists.
+
+For templated SQL, each distinct template name is resolved and written once per
+statement. Repeated names reuse a range in the final SQL buffer; no intermediate
+replacement string is stored. Results can borrow from the policy, template, or
+key and are consumed immediately without boxing. The final SQL and template
+range cache still allocate; this is not a completely allocation-free query path.
+Streams resolve only when first polled. Errors from the policy, formatter, or
+identifier validation fail before a query acquires a connection.
+
+Closures `Fn(&str, &dyn MysqlRouteKey) -> MysqlResult<O>` are also supported when
+`O: MysqlRouteOutput + 'static`, for example a closure returning `Ok("tasks")`,
+a number, or an owned formatting object. For results borrowing from inputs,
+implement `MysqlRouting` as above. An internal adapter retains the fixed
+`ShardedMysqlService` type while each policy returns its own concrete result;
+`MysqlRouting` itself is no longer usable as a trait object.
 
 ### SQL templates
 
-Both template forms are supported, including multiple occurrences and joins:
+Template names come from the SQL. The policy is only asked for names used by the
+current statement; it no longer returns a table map or handles unused names.
+Templates can replace whole identifiers or fragments, including quoted names:
 
 ```sql
-SELECT id FROM tasks_{{table_suffix}} WHERE user_id = ?;
+SELECT id FROM {{tasks}} WHERE user_id = ?;
+SELECT id FROM tasks_{{slot}} WHERE user_id = ?;
+SELECT id FROM `{{prefix}}_{{slot}}` WHERE user_id = ?;
 SELECT t.id FROM {{tasks}} t JOIN {{subtasks}} s ON s.task_id = t.id
 WHERE t.user_id = ?;
 ```
 
-- `table_suffix` is reserved for the suffix supplied by `with_table_suffix`.
-  It must follow an ASCII identifier prefix and end that identifier.
-- Other names refer to full tables supplied by `with_table(logical, physical)`.
-  Full table tokens occupy a complete identifier and are rendered with backtick
-  quoting. Already backtick-quoted templates are also supported.
-- A policy may supply mappings that a particular query does not use. Every
-  template used in the query must have a matching route result.
-- Suffixes accept nonempty ASCII letters, digits and underscores. Table names
-  accept ASCII letters, digits, underscores and dollar signs, cannot begin with
-  a digit, and cannot contain database qualifiers. Identifiers are bounded by
-  MySQL's 64-character limit. No SQL fragments are accepted as route results.
+- `table_suffix` continues to work as a template name, but is no longer reserved.
+  The policy receives that name just like `tasks`, `slot`, or `prefix`.
+- Each replacement must write 1..=64 ASCII letters, digits, underscores or dollar
+  signs. The complete rendered identifier must also fit 64 characters and cannot
+  start with a digit. The component adds backtick quoting. Dots, quotes, SQL
+  fragments and non-ASCII replacements are rejected, including formatter writes
+  whose errors were ignored by the result object.
 - Templates inside single/double-quoted string literals and ordinary comments
-  are left unchanged. The scanner follows MySQL's usual backslash/doubled-quote
-  string escaping; SQL using `ANSI_QUOTES` or `NO_BACKSLASH_ESCAPES` is not
-  supported for template rendering. Templates inside executable `/*! ... */`
-  comments are rejected. This is an identifier template renderer, not a SQL AST
-  parser or a general-purpose text interpolation facility.
+  are unchanged. The scanner follows MySQL's usual backslash/doubled-quote string
+  escaping; `ANSI_QUOTES` and `NO_BACKSLASH_ESCAPES` modes are unsupported for
+  rendering. Templates inside executable `/*! ... */` comments are rejected.
+  This is an identifier renderer, not a SQL AST parser or general interpolator.
 
 ### Single-database transactions
 
@@ -319,7 +356,7 @@ argument, or an explicit key from `transaction.route(key)`:
 ```rust
 use brz_mysql::MysqlTransaction;
 
-repository.mysql.with_transaction(async |transaction| {
+tasks.with_transaction(async |transaction| {
     transaction.execute(
         "DELETE FROM {{subtasks}} WHERE user_id = ? AND task_id = ?",
         (uid, task_id),
@@ -336,8 +373,9 @@ repository.mysql.with_transaction(async |transaction| {
 
 An optional `.route(key)` on the service supplies the transaction's default key;
 a per-statement key overrides it without changing subsequent statements. The
-policy resolves once per templated statement. All statements commit or roll back
-together, even when they address different physical tables in this database.
+policy resolves once per distinct template name in each statement. All statements
+commit or roll back together, even when they address different physical tables
+in this database.
 There is no per-statement connection/pool switch. When multi-database support is
 added, transactions in that mode will be disabled initially.
 
@@ -347,12 +385,23 @@ application shutdown; closing it closes the shared pool for every handle.
 
 ### Migration
 
-This is an intentional API replacement: `MysqlTableSharding`,
-`MysqlTableSelector`, `MysqlTableSelection`, `MysqlSelectorValue`,
-`MysqlServiceOptions::table_sharding`, and `with_table_sharding` are removed.
-Move selection logic into `MysqlRouting`, attach it with `with_route`, and return
-`MysqlRoute` mappings. The new `MysqlRouteValue` exposes the typed routing key.
-There is no automatic legacy/base-table fallback.
+This intentionally changes the routing API from 0.0.6:
+
+- Replace `resolve(key: MysqlRouteValue) -> MysqlResult<MysqlRoute>` with
+  `resolve(template, key: &dyn MysqlRouteKey) -> MysqlResult<impl MysqlRouteOutput>`
+  (use the shared lifetime shown above for borrowed results).
+- `MysqlRoute`, `with_table`, and `with_table_suffix` are removed. Match the
+  current template name and return its replacement as a string, `Display`
+  value, or lightweight object implementing `write_to`.
+- Explicit custom keys no longer implement `MysqlValue` or convert themselves
+  into a primitive enum. Use `downcast_ref` in the strategy. `MysqlRouteValue`
+  remains only as the first-SQL-argument adapter for existing `MysqlValue` and
+  `MysqlArgs` implementations.
+- A policy now runs once per distinct template name, rather than once for the
+  entire statement. Template names in existing SQL can be kept.
+
+There is no automatic legacy/base-table fallback. The example's `ByTaskId` and
+`ByUserId` behavior is defined entirely by its application policy.
 
 ## Allocation boundary
 
