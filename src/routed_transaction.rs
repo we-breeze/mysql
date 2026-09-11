@@ -6,7 +6,7 @@ use futures_util::{StreamExt, pin_mut};
 
 use crate::{
     FromMysqlRow, MysqlArgs, MysqlExecution, MysqlResult, MysqlTransaction,
-    MysqlTransactionService, mysql_service::render_query, sharded_service::QueryRouting,
+    MysqlTransactionService, mysql_service::render_query, query_routing::QueryRouting,
 };
 
 /// A borrowed query view; it never starts, commits, or moves the transaction.

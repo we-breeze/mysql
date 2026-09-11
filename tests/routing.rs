@@ -7,7 +7,7 @@ use std::sync::{
 
 use brz_mysql::{
     FromMysqlRow, Mysql, MysqlError, MysqlResult, MysqlRouteKey, MysqlRouteOutput, MysqlRouting,
-    MysqlService, MysqlServiceOptions, MysqlTransaction, ShardedMysqlService,
+    MysqlService, MysqlServiceOptions, MysqlTransaction,
 };
 use futures_util::{StreamExt, pin_mut};
 
@@ -44,9 +44,7 @@ struct IdRow {
     id: u64,
 }
 
-async fn setup(
-    prefix: &'static str,
-) -> Option<(MysqlService, ShardedMysqlService, Arc<AtomicUsize>)> {
+async fn setup(prefix: &'static str) -> Option<(MysqlService, MysqlService, Arc<AtomicUsize>)> {
     let Some(url) = std::env::var("BREEZE_MYSQL_TEST_URL")
         .ok()
         .filter(|url| !url.is_empty())
@@ -72,7 +70,7 @@ async fn setup(
     }
     let calls = Arc::new(AtomicUsize::new(0));
     // Exercise the trait entry point, as used by generic repositories.
-    fn attach<M: Mysql>(mysql: &M, routing: TaskRouting) -> ShardedMysqlService {
+    fn attach<M: Mysql>(mysql: &M, routing: TaskRouting) -> MysqlService {
         mysql.with_route(routing)
     }
     let tasks = attach(
@@ -94,7 +92,7 @@ async fn owned_service_shares_one_pool_and_isolates_concurrent_query_keys() {
     // A repository can own the concrete routed service without a lifetime or
     // generic policy parameter. Both services continue to share the same pool.
     struct Tasks {
-        mysql: ShardedMysqlService,
+        mysql: MysqlService,
     }
     let repository = Tasks {
         mysql: tasks.clone(),
@@ -203,7 +201,10 @@ async fn owned_service_shares_one_pool_and_isolates_concurrent_query_keys() {
             .value,
         "still open"
     );
-    mysql.close().await;
+    // Lifecycle methods are available on routed services too, and close the
+    // same pool used by the plain service.
+    tasks.close().await;
+    assert!(mysql.ping().await.is_err());
 }
 
 #[tokio::test]

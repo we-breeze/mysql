@@ -13,10 +13,10 @@ mod binary_column;
 mod column;
 mod metrics;
 mod mysql_service;
+mod query_routing;
 mod routed_transaction;
 mod routing;
 mod row;
-mod sharded_service;
 
 pub use api::{
     Mysql, MysqlError, MysqlExecution, MysqlResult, MysqlServiceOptions, MysqlTransaction,
@@ -30,4 +30,3 @@ pub use mysql_service::{MysqlService, MysqlTransactionService};
 pub use routed_transaction::RoutedMysqlTransaction;
 pub use routing::{MysqlRouteKey, MysqlRouteOutput, MysqlRouting};
 pub use row::{FromMysqlRow, FromMysqlValue, MysqlRow};
-pub use sharded_service::ShardedMysqlService;
