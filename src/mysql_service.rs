@@ -269,7 +269,7 @@ impl Mysql for MysqlService {
         MysqlService::with_route(self, routing)
     }
 
-    fn route<K: MysqlRouteKey>(&self, key: K) -> MysqlService {
+    fn route<K: MysqlRouteKey>(&self, key: K) -> Self {
         MysqlService::route(self, key)
     }
 

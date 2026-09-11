@@ -9,7 +9,7 @@ fn lazy() -> MysqlService {
     MysqlService::connect_lazy("mysql://user:secret@127.0.0.1:1/test").unwrap()
 }
 
-fn bind_key<M: Mysql, K: MysqlRouteKey>(mysql: &M, key: K) -> MysqlService {
+fn bind_key<M: Mysql, K: MysqlRouteKey>(mysql: &M, key: K) -> M {
     mysql.route(key)
 }
 

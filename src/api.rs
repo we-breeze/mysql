@@ -178,8 +178,9 @@ pub trait Mysql: Send + Sync {
         R: MysqlRouting + 'static;
 
     /// Bind an explicit key on an independent handle sharing this service's
-    /// policy and pool. Without a policy this is a no-op, as on `MysqlService`.
-    fn route<K: MysqlRouteKey>(&self, key: K) -> MysqlService;
+    /// policy and pool, preserving the implementation type. Without a policy
+    /// this is a no-op, as on `MysqlService`.
+    fn route<K: MysqlRouteKey>(&self, key: K) -> Self;
 
     async fn execute<S, A>(&self, sql: S, arguments: A) -> MysqlResult<MysqlExecution>
     where

@@ -210,7 +210,8 @@ not a separate public service type. `MysqlServiceOptions` contains only
 pool/session settings; binding a policy does not change other handles.
 
 Both methods are part of the `Mysql` trait. Since 0.0.9, generic repositories
-with `M: Mysql` can call `mysql.route(key)` directly; custom `Mysql`
+with `M: Mysql` can call `mysql.route(key)` directly and get `M` back (`Self`
+in the trait signature); custom `Mysql`
 implementations must also implement `route`.
 
 A policy receives the current template name and a key, and returns a lightweight
