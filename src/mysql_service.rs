@@ -65,9 +65,22 @@ impl MysqlService {
         S: AsRef<str> + Send,
         A: MysqlArgs + Send,
     {
+        self.execute_with_routing(sql, arguments, None).await
+    }
+
+    pub(crate) async fn execute_with_routing<S, A>(
+        &self,
+        sql: S,
+        arguments: A,
+        routing: Option<&QueryRouting>,
+    ) -> MysqlResult<MysqlExecution>
+    where
+        S: AsRef<str> + Send,
+        A: MysqlArgs + Send,
+    {
         let observation = Observation::new(self.metrics.update);
         let result = async {
-            let (sql, arguments) = prepare_query(sql.as_ref(), arguments, None)?;
+            let (sql, arguments) = prepare_query(sql.as_ref(), arguments, routing)?;
             sqlx::query_with::<MySql, _>(sql.as_ref(), arguments)
                 .execute(&self.pool)
                 .await
@@ -85,9 +98,23 @@ impl MysqlService {
         A: MysqlArgs + Send,
         T: FromMysqlRow + Send,
     {
+        self.fetch_optional_with_routing(sql, arguments, None).await
+    }
+
+    pub(crate) async fn fetch_optional_with_routing<S, A, T>(
+        &self,
+        sql: S,
+        arguments: A,
+        routing: Option<&QueryRouting>,
+    ) -> MysqlResult<Option<T>>
+    where
+        S: AsRef<str> + Send,
+        A: MysqlArgs + Send,
+        T: FromMysqlRow + Send,
+    {
         let observation = Observation::new(self.metrics.get);
         let result = async {
-            let (sql, arguments) = prepare_query(sql.as_ref(), arguments, None)?;
+            let (sql, arguments) = prepare_query(sql.as_ref(), arguments, routing)?;
             sqlx::query_with::<MySql, _>(sql.as_ref(), arguments)
                 .fetch_optional(&self.pool)
                 .await
@@ -106,9 +133,23 @@ impl MysqlService {
         A: MysqlArgs + Send,
         T: FromMysqlRow + Send,
     {
+        self.fetch_one_with_routing(sql, arguments, None).await
+    }
+
+    pub(crate) async fn fetch_one_with_routing<S, A, T>(
+        &self,
+        sql: S,
+        arguments: A,
+        routing: Option<&QueryRouting>,
+    ) -> MysqlResult<T>
+    where
+        S: AsRef<str> + Send,
+        A: MysqlArgs + Send,
+        T: FromMysqlRow + Send,
+    {
         let observation = Observation::new(self.metrics.get);
         let result = async {
-            let (sql, arguments) = prepare_query(sql.as_ref(), arguments, None)?;
+            let (sql, arguments) = prepare_query(sql.as_ref(), arguments, routing)?;
             sqlx::query_with::<MySql, _>(sql.as_ref(), arguments)
                 .fetch_optional(&self.pool)
                 .await
@@ -133,13 +174,27 @@ impl MysqlService {
         A: MysqlArgs + Send + 'service,
         T: FromMysqlRow + Send + 'service,
     {
+        self.fetch_with_routing(sql, arguments, None)
+    }
+
+    pub(crate) fn fetch_with_routing<'service, S, A, T>(
+        &'service self,
+        sql: S,
+        arguments: A,
+        routing: Option<&'service QueryRouting>,
+    ) -> impl Stream<Item = MysqlResult<T>> + Send + 'service
+    where
+        S: AsRef<str> + Send + 'service,
+        A: MysqlArgs + Send + 'service,
+        T: FromMysqlRow + Send + 'service,
+    {
         stream! {
             let observation = Observation::new(self.metrics.list);
             let mut success = true;
             let (sql, arguments) = match prepare_query(
                 sql.as_ref(),
                 arguments,
-                None,
+                routing,
             ) {
                 Ok(prepared) => prepared,
                 Err(error) => {
