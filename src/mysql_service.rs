@@ -13,16 +13,19 @@ use sqlx::{
 use crate::metrics::{MysqlMetrics, Observation};
 
 use crate::{
-    FromMysqlRow, Mysql, MysqlArgs, MysqlError, MysqlExecution, MysqlResult, MysqlRouting,
-    MysqlRow, MysqlServiceOptions, MysqlTransaction, ShardedMysqlService,
-    arguments::encode_arguments, routing::render_sql, sharded_service::QueryRouting,
+    FromMysqlRow, Mysql, MysqlArgs, MysqlError, MysqlExecution, MysqlResult, MysqlRouteKey,
+    MysqlRouting, MysqlRow, MysqlServiceOptions, MysqlTransaction, arguments::encode_arguments,
+    query_routing::QueryRouting, routing::render_sql,
 };
 
-/// SQLx-backed MySQL service.
+/// SQLx-backed MySQL service with optional per-handle table routing.
+/// Clones and handles created by `with_route`/`route` share one connection pool.
+/// Plain SQL bypasses routing; templated SQL uses the handle's policy and key.
 #[derive(Clone, Debug)]
 pub struct MysqlService {
     pool: MySqlPool,
     metrics: MysqlMetrics,
+    routing: Option<QueryRouting>,
 }
 
 impl MysqlService {
@@ -40,7 +43,11 @@ impl MysqlService {
             .connect_with(connect_options)
             .await
             .map_err(map_sqlx_error)?;
-        Ok(Self { pool, metrics })
+        Ok(Self {
+            pool,
+            metrics,
+            routing: None,
+        })
     }
 
     pub fn connect_lazy(url: &str) -> MysqlResult<Self> {
@@ -52,12 +59,29 @@ impl MysqlService {
         Ok(Self {
             metrics: MysqlMetrics::new(connect_options.get_host()),
             pool: pool_options.connect_lazy_with(connect_options),
+            routing: None,
         })
     }
 
-    /// Create an owned routed handle without allocating another connection pool.
-    pub fn with_route<R: MysqlRouting + 'static>(&self, routing: R) -> ShardedMysqlService {
-        ShardedMysqlService::new(self.clone(), routing)
+    /// Bind a policy on an independent service sharing this connection pool.
+    /// Rebinding replaces the policy and clears any explicit key.
+    pub fn with_route<R: MysqlRouting + 'static>(&self, routing: R) -> Self {
+        Self {
+            pool: self.pool.clone(),
+            metrics: self.metrics,
+            routing: Some(QueryRouting::new(routing)),
+        }
+    }
+
+    /// Bind a key on an independent service without changing the original.
+    /// The key is never encoded as a SQL argument. Without a policy this is a
+    /// no-op; templated SQL still requires `with_route`, and plain SQL is unchanged.
+    pub fn route<K: MysqlRouteKey>(&self, key: K) -> Self {
+        Self {
+            pool: self.pool.clone(),
+            metrics: self.metrics,
+            routing: self.routing.as_ref().map(|routing| routing.with_key(key)),
+        }
     }
 
     pub async fn execute<S, A>(&self, sql: S, arguments: A) -> MysqlResult<MysqlExecution>
@@ -65,22 +89,9 @@ impl MysqlService {
         S: AsRef<str> + Send,
         A: MysqlArgs + Send,
     {
-        self.execute_with_routing(sql, arguments, None).await
-    }
-
-    pub(crate) async fn execute_with_routing<S, A>(
-        &self,
-        sql: S,
-        arguments: A,
-        routing: Option<&QueryRouting>,
-    ) -> MysqlResult<MysqlExecution>
-    where
-        S: AsRef<str> + Send,
-        A: MysqlArgs + Send,
-    {
         let observation = Observation::new(self.metrics.update);
         let result = async {
-            let (sql, arguments) = prepare_query(sql.as_ref(), arguments, routing)?;
+            let (sql, arguments) = prepare_query(sql.as_ref(), arguments, self.routing.as_ref())?;
             sqlx::query_with::<MySql, _>(sql.as_ref(), arguments)
                 .execute(&self.pool)
                 .await
@@ -98,23 +109,9 @@ impl MysqlService {
         A: MysqlArgs + Send,
         T: FromMysqlRow + Send,
     {
-        self.fetch_optional_with_routing(sql, arguments, None).await
-    }
-
-    pub(crate) async fn fetch_optional_with_routing<S, A, T>(
-        &self,
-        sql: S,
-        arguments: A,
-        routing: Option<&QueryRouting>,
-    ) -> MysqlResult<Option<T>>
-    where
-        S: AsRef<str> + Send,
-        A: MysqlArgs + Send,
-        T: FromMysqlRow + Send,
-    {
         let observation = Observation::new(self.metrics.get);
         let result = async {
-            let (sql, arguments) = prepare_query(sql.as_ref(), arguments, routing)?;
+            let (sql, arguments) = prepare_query(sql.as_ref(), arguments, self.routing.as_ref())?;
             sqlx::query_with::<MySql, _>(sql.as_ref(), arguments)
                 .fetch_optional(&self.pool)
                 .await
@@ -133,23 +130,9 @@ impl MysqlService {
         A: MysqlArgs + Send,
         T: FromMysqlRow + Send,
     {
-        self.fetch_one_with_routing(sql, arguments, None).await
-    }
-
-    pub(crate) async fn fetch_one_with_routing<S, A, T>(
-        &self,
-        sql: S,
-        arguments: A,
-        routing: Option<&QueryRouting>,
-    ) -> MysqlResult<T>
-    where
-        S: AsRef<str> + Send,
-        A: MysqlArgs + Send,
-        T: FromMysqlRow + Send,
-    {
         let observation = Observation::new(self.metrics.get);
         let result = async {
-            let (sql, arguments) = prepare_query(sql.as_ref(), arguments, routing)?;
+            let (sql, arguments) = prepare_query(sql.as_ref(), arguments, self.routing.as_ref())?;
             sqlx::query_with::<MySql, _>(sql.as_ref(), arguments)
                 .fetch_optional(&self.pool)
                 .await
@@ -174,27 +157,13 @@ impl MysqlService {
         A: MysqlArgs + Send + 'service,
         T: FromMysqlRow + Send + 'service,
     {
-        self.fetch_with_routing(sql, arguments, None)
-    }
-
-    pub(crate) fn fetch_with_routing<'service, S, A, T>(
-        &'service self,
-        sql: S,
-        arguments: A,
-        routing: Option<&'service QueryRouting>,
-    ) -> impl Stream<Item = MysqlResult<T>> + Send + 'service
-    where
-        S: AsRef<str> + Send + 'service,
-        A: MysqlArgs + Send + 'service,
-        T: FromMysqlRow + Send + 'service,
-    {
         stream! {
             let observation = Observation::new(self.metrics.list);
             let mut success = true;
             let (sql, arguments) = match prepare_query(
                 sql.as_ref(),
                 arguments,
-                routing,
+                self.routing.as_ref(),
             ) {
                 Ok(prepared) => prepared,
                 Err(error) => {
@@ -237,24 +206,9 @@ impl MysqlService {
             ) -> MysqlResult<T>
             + Send,
     {
-        self.run_transaction(None, operation).await
-    }
-
-    pub(crate) async fn run_transaction<T, F>(
-        &self,
-        route: Option<QueryRouting>,
-        operation: F,
-    ) -> MysqlResult<T>
-    where
-        T: Send,
-        F: for<'transaction> AsyncFnOnce(
-                &'transaction mut MysqlTransactionService,
-            ) -> MysqlResult<T>
-            + Send,
-    {
         let observation = Observation::new(self.metrics.transaction);
         let result = async {
-            let mut transaction = self.begin(route).await?;
+            let mut transaction = self.begin(self.routing.clone()).await?;
             match operation(&mut transaction).await {
                 Ok(value) => {
                     transaction.commit().await?;
@@ -290,6 +244,7 @@ impl MysqlService {
         }
     }
 
+    /// Close the pool shared by every clone and routed handle.
     pub async fn close(&self) {
         self.pool.close().await;
     }
@@ -310,7 +265,7 @@ impl MysqlService {
 impl Mysql for MysqlService {
     type Transaction = MysqlTransactionService;
 
-    fn with_route<R: MysqlRouting + 'static>(&self, routing: R) -> ShardedMysqlService {
+    fn with_route<R: MysqlRouting + 'static>(&self, routing: R) -> MysqlService {
         MysqlService::with_route(self, routing)
     }
 
@@ -700,3 +655,6 @@ mod tests {
         assert!(!format!("{error:?}").contains("top-secret"));
     }
 }
+
+#[cfg(test)]
+mod routing_tests;

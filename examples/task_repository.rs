@@ -3,7 +3,7 @@
 
 use brz_mysql::{
     FromMysqlRow, Mysql, MysqlResult, MysqlRouteKey, MysqlRouteOutput, MysqlRouting, MysqlService,
-    MysqlTransaction, ShardedMysqlService,
+    MysqlTransaction,
 };
 
 // These types need no MysqlValue implementation and preserve their meaning.
@@ -69,7 +69,7 @@ struct Task {
 }
 
 struct TaskRepository {
-    mysql: ShardedMysqlService,
+    mysql: MysqlService,
 }
 
 impl TaskRepository {

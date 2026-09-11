@@ -5,7 +5,7 @@ use std::time::Duration;
 use futures_core::Stream;
 use thiserror::Error;
 
-use crate::{FromMysqlRow, MysqlArgs, MysqlRouting, ShardedMysqlService};
+use crate::{FromMysqlRow, MysqlArgs, MysqlRouting, MysqlService};
 
 /// Result metadata for a write statement.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -173,7 +173,7 @@ pub trait Mysql: Send + Sync {
 
     /// Bind an application routing policy to an owned handle sharing this
     /// service's connection pool. SQL arguments remain independent of routing.
-    fn with_route<R>(&self, routing: R) -> ShardedMysqlService
+    fn with_route<R>(&self, routing: R) -> MysqlService
     where
         R: MysqlRouting + 'static;
 

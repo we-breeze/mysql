@@ -202,11 +202,12 @@ the brz-mysql abstraction does not add a stream boxing allocation.
 
 ## Table routing
 
-`Mysql::with_route` binds an application policy and returns an owned, fixed-type
-`ShardedMysqlService`. It also implements `Mysql`, so a repository can retain it
-without policy type parameters or borrowing the parent service. All handles
-share the parent's pool. `MysqlServiceOptions` contains only pool/session
-settings; routing does not change global service configuration.
+`MysqlService` is the single service type for ordinary and routed queries.
+`with_route(policy)` and `route(key)` return independent `MysqlService` handles
+sharing the same pool; a repository always stores `MysqlService` and can also
+use the generic `M: Mysql` query contract. Routing is optional internal state,
+not a separate public service type. `MysqlServiceOptions` contains only
+pool/session settings; binding a policy does not change other handles.
 
 A policy receives the current template name and a key, and returns a lightweight
 `MysqlRouteOutput`. The component calls `write_to` to write it directly into the
@@ -287,9 +288,11 @@ Explicit `Option<T>` and newtypes retain their original type; their semantics
 belong to the policy. Dynamic strings must be owned, not borrowed from locals.
 
 The key precedence remains **explicit `.route(key)` > first SQL argument**.
-An explicit key is never added to bound arguments. Binding a key does not change
-the original handle; cloning shares its policy, key and pool. `with_route` on an
-existing handle replaces the policy and clears its explicit key.
+An explicit key is never added to bound arguments. Without a policy, `.route(key)`
+returns an unchanged clone: plain SQL still works and templates still require
+`with_route`. Binding a key does not change the original handle; cloning shares
+its policy, key and pool. `with_route` on an existing handle replaces the policy
+and clears its explicit key.
 
 The implicit first-argument path still uses `MysqlValue::route_value()` and
 `MysqlArgs::first_route_value()`. It adapts values once per templated statement:
@@ -299,7 +302,7 @@ copied once to `String`/`Vec<u8>` to satisfy the `Any` contract; they remain usa
 as SQL parameters. Unsupported values require an explicit `.route(key)`.
 No adaptation runs for plain SQL or when an explicit key is present.
 
-Ordinary SQL can use either the parent `MysqlService` or the same sharded handle.
+Ordinary SQL can use any `MysqlService` handle, with or without a policy.
 SQL without templates bypasses key extraction and the policy, even with an
 explicit key. It reuses the existing template check and borrows the original SQL
 without copying. Forgetting a template executes the table name as written,
@@ -317,7 +320,7 @@ Closures `Fn(&str, &dyn MysqlRouteKey) -> MysqlResult<O>` are also supported whe
 `O: MysqlRouteOutput + 'static`, for example a closure returning `Ok("tasks")`,
 a number, or an owned formatting object. For results borrowing from inputs,
 implement `MysqlRouting` as above. An internal adapter retains the fixed
-`ShardedMysqlService` type while each policy returns its own concrete result;
+`MysqlService` type while each policy returns its own concrete result;
 `MysqlRouting` itself is no longer usable as a trait object.
 
 ### SQL templates
@@ -381,11 +384,16 @@ added, transactions in that mode will be disabled initially.
 
 See [examples/task_repository.rs](examples/task_repository.rs) for a compilable
 repository using these interfaces. Close the parent `MysqlService` once at
-application shutdown; closing it closes the shared pool for every handle.
+application shutdown. Calling `close()` on any handle, routed or plain, closes
+the shared pool for every handle; dropping a clone does not close the pool.
 
 ### Migration
 
-This intentionally changes the routing API from 0.0.6:
+When upgrading from 0.0.7, replace `ShardedMysqlService` imports and fields with
+`MysqlService`. `with_route` and `route` return `MysqlService`; query call sites
+and policies stay the same. `ShardedMysqlService` is no longer exported.
+
+For the earlier routing API from 0.0.6:
 
 - Replace `resolve(key: MysqlRouteValue) -> MysqlResult<MysqlRoute>` with
   `resolve(template, key: &dyn MysqlRouteKey) -> MysqlResult<impl MysqlRouteOutput>`
