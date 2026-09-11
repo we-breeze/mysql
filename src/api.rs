@@ -5,7 +5,7 @@ use std::time::Duration;
 use futures_core::Stream;
 use thiserror::Error;
 
-use crate::{FromMysqlRow, MysqlArgs, MysqlRouting, MysqlService};
+use crate::{FromMysqlRow, MysqlArgs, MysqlRouteKey, MysqlRouting, MysqlService};
 
 /// Result metadata for a write statement.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -176,6 +176,10 @@ pub trait Mysql: Send + Sync {
     fn with_route<R>(&self, routing: R) -> MysqlService
     where
         R: MysqlRouting + 'static;
+
+    /// Bind an explicit key on an independent handle sharing this service's
+    /// policy and pool. Without a policy this is a no-op, as on `MysqlService`.
+    fn route<K: MysqlRouteKey>(&self, key: K) -> MysqlService;
 
     async fn execute<S, A>(&self, sql: S, arguments: A) -> MysqlResult<MysqlExecution>
     where

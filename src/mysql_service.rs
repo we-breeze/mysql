@@ -269,6 +269,10 @@ impl Mysql for MysqlService {
         MysqlService::with_route(self, routing)
     }
 
+    fn route<K: MysqlRouteKey>(&self, key: K) -> MysqlService {
+        MysqlService::route(self, key)
+    }
+
     async fn execute<S, A>(&self, sql: S, arguments: A) -> MysqlResult<MysqlExecution>
     where
         S: AsRef<str> + Send,

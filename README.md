@@ -209,6 +209,10 @@ use the generic `M: Mysql` query contract. Routing is optional internal state,
 not a separate public service type. `MysqlServiceOptions` contains only
 pool/session settings; binding a policy does not change other handles.
 
+Both methods are part of the `Mysql` trait. Since 0.0.9, generic repositories
+with `M: Mysql` can call `mysql.route(key)` directly; custom `Mysql`
+implementations must also implement `route`.
+
 A policy receives the current template name and a key, and returns a lightweight
 `MysqlRouteOutput`. The component calls `write_to` to write it directly into the
 SQL buffer. All `Display` types (including strings and numbers) implement

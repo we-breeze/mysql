@@ -9,13 +9,17 @@ fn lazy() -> MysqlService {
     MysqlService::connect_lazy("mysql://user:secret@127.0.0.1:1/test").unwrap()
 }
 
+fn bind_key<M: Mysql, K: MysqlRouteKey>(mysql: &M, key: K) -> MysqlService {
+    mysql.route(key)
+}
+
 #[tokio::test]
 async fn one_service_type_keeps_policy_and_key_bindings_independent() {
     let plain = lazy();
     let policy = |name: &str, key: &dyn MysqlRouteKey| Ok(format!("{name}_{:04}", key.as_u64()?));
     // Inherent and trait entry points both return the same concrete type.
     let routed: MysqlService = Mysql::with_route(&plain, policy);
-    let keyed: MysqlService = routed.route(17_u64);
+    let keyed: MysqlService = bind_key(&routed, 17_u64);
     let rebound: MysqlService = keyed.with_route(|name: &str, key: &dyn MysqlRouteKey| {
         Ok(format!("{name}_{:04}", key.as_u64()? + 100))
     });
@@ -45,7 +49,7 @@ async fn one_service_type_keeps_policy_and_key_bindings_independent() {
 async fn key_without_policy_does_not_enable_routing_or_leak_through_debug() {
     struct PrivateKey(&'static str);
     let mysql = lazy();
-    let plain = mysql.route(PrivateKey("private-route-key"));
+    let plain = bind_key(&mysql, PrivateKey("private-route-key"));
     assert!(plain.routing.is_none());
     assert!(matches!(
         render_query("SELECT ?", &(1,), plain.routing.as_ref()).unwrap(),
