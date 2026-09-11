@@ -390,10 +390,7 @@ impl std::fmt::Debug for MysqlTransactionService {
 impl MysqlTransactionService {
     /// Bind a key for queries on this same transaction connection. The
     /// transaction's default routing key is unchanged after this view is dropped.
-    pub fn route<K: crate::MysqlValue + Sync + 'static>(
-        &mut self,
-        key: K,
-    ) -> crate::RoutedMysqlTransaction<'_> {
+    pub fn route<K: crate::MysqlRouteKey>(&mut self, key: K) -> crate::RoutedMysqlTransaction<'_> {
         let routing = self.route.as_ref().map(|routing| routing.with_key(key));
         crate::RoutedMysqlTransaction::new(self, routing)
     }
@@ -566,16 +563,12 @@ pub(crate) fn render_query<'sql, A: MysqlArgs>(
     arguments: &A,
     routing: Option<&QueryRouting>,
 ) -> MysqlResult<Cow<'sql, str>> {
-    match render_sql(sql, None, false) {
-        Ok(plain) => Ok(plain),
-        Err(error) => match routing {
-            Some(routing) => {
-                let route = routing.resolve(arguments)?;
-                render_sql(sql, Some(&route), false)
-            }
-            None => Err(error),
-        },
-    }
+    let mut implicit_key = None;
+    render_sql(sql, |template, out| {
+        let routing =
+            routing.ok_or_else(|| crate::routing::invalid("table templates require with_route"))?;
+        routing.render_template(template, arguments, &mut implicit_key, out)
+    })
 }
 
 fn build_options(

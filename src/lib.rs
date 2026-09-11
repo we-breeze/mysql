@@ -28,6 +28,6 @@ pub use brz_mysql_derive::{FromMysqlCol, FromMysqlRow};
 pub use column::FromMysqlCol;
 pub use mysql_service::{MysqlService, MysqlTransactionService};
 pub use routed_transaction::RoutedMysqlTransaction;
-pub use routing::{MysqlRoute, MysqlRouting};
+pub use routing::{MysqlRouteKey, MysqlRouteOutput, MysqlRouting};
 pub use row::{FromMysqlRow, FromMysqlValue, MysqlRow};
 pub use sharded_service::ShardedMysqlService;

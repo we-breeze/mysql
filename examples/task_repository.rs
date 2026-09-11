@@ -2,23 +2,63 @@
 //! Run with DATABASE_URL pointing to a database containing your task tables.
 
 use brz_mysql::{
-    FromMysqlRow, Mysql, MysqlResult, MysqlRoute, MysqlRouteValue, MysqlRouting, MysqlService,
+    FromMysqlRow, Mysql, MysqlResult, MysqlRouteKey, MysqlRouteOutput, MysqlRouting, MysqlService,
     MysqlTransaction, ShardedMysqlService,
 };
+
+// These types need no MysqlValue implementation and preserve their meaning.
+struct ByTaskId(u64);
+struct ByUserId(u64);
 
 struct TaskRouting {
     shard_count: u64,
 }
 
+struct TableName<'a> {
+    prefix: &'a str,
+    slot: Option<u64>,
+}
+
+impl MysqlRouteOutput for TableName<'_> {
+    fn write_to(&self, out: &mut dyn std::fmt::Write) -> std::fmt::Result {
+        out.write_str(self.prefix)?;
+        if let Some(slot) = self.slot {
+            write!(out, "_{slot:04}")?;
+        }
+        Ok(())
+    }
+}
+
 impl MysqlRouting for TaskRouting {
-    fn resolve(&self, key: MysqlRouteValue<'_>) -> MysqlResult<MysqlRoute> {
-        // The application owns uid semantics and validates its configuration.
-        let uid = key.as_u64()?;
-        let suffix = format!("{:04}", uid % self.shard_count);
-        MysqlRoute::new()
-            .with_table_suffix(&suffix)?
-            .with_table("tasks", format!("tasks_{suffix}"))?
-            .with_table("subtasks", format!("subtasks_{suffix}"))
+    fn resolve<'a>(
+        &'a self,
+        template: &'a str,
+        key: &'a dyn MysqlRouteKey,
+    ) -> MysqlResult<impl MysqlRouteOutput + 'a> {
+        if !matches!(template, "tasks" | "subtasks") {
+            return Err(brz_mysql::MysqlError::InvalidQuery {
+                reason: format!("unknown template: {template}"),
+            });
+        }
+        // Example application rules: legacy task IDs use the base table;
+        // new-format IDs carry the owner's uid in bits 37..53.
+        let uid = if let Some(ByTaskId(id)) = key.downcast_ref::<ByTaskId>() {
+            if *id < (1 << 37) {
+                None
+            } else {
+                Some((id >> 37) & 0xffff)
+            }
+        } else if let Some(ByUserId(uid)) = key.downcast_ref::<ByUserId>() {
+            Some(*uid)
+        } else {
+            // Keep first-SQL-argument routing for ordinary numeric user IDs.
+            Some(key.as_u64()?)
+        };
+        // No String allocation: borrow the template and retain just the slot.
+        Ok(TableName {
+            prefix: template,
+            slot: uid.map(|uid| uid % self.shard_count),
+        })
     }
 }
 
@@ -49,11 +89,18 @@ impl TaskRepository {
             .await
     }
 
+    async fn find_by_task_id(&self, task_id: u64) -> MysqlResult<Option<Task>> {
+        self.mysql
+            .route(ByTaskId(task_id))
+            .fetch_optional("SELECT id, title FROM {{tasks}} WHERE id = ?", (task_id,))
+            .await
+    }
+
     async fn rename(&self, uid: u64, task_id: u64, title: &str) -> MysqlResult<()> {
         self.mysql
-            .route(uid)
+            .route(ByUserId(uid))
             .execute(
-                "UPDATE tasks_{{table_suffix}} SET title = ? WHERE id = ?",
+                "UPDATE {{tasks}} SET title = ? WHERE id = ?",
                 (title, task_id),
             )
             .await?;
@@ -65,7 +112,7 @@ impl TaskRepository {
         self.mysql
             .with_transaction(async |tx| {
                 for (uid, task_id, title) in changes {
-                    tx.route(*uid)
+                    tx.route(ByUserId(*uid))
                         .execute(
                             "UPDATE {{tasks}} SET title = ? WHERE id = ?",
                             (title.as_str(), *task_id),
@@ -84,6 +131,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tasks = TaskRepository::new(&mysql);
     // Importing this example does not write any rows. These methods show the
     // write/transaction interface and can be called by the owning application.
+    let _ = TaskRepository::find_by_task_id;
     let _ = TaskRepository::rename;
     let _ = TaskRepository::rename_atomically;
     if let Some(task) = tasks.find(509, 69_956_427_469_753).await? {
