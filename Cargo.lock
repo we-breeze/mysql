@@ -133,7 +133,7 @@ dependencies = [
 
 [[package]]
 name = "brz-mysql"
-version = "0.0.9"
+version = "0.0.10"
 dependencies = [
  "async-stream",
  "brz-metrics",
@@ -151,7 +151,7 @@ dependencies = [
 
 [[package]]
 name = "brz-mysql-derive"
-version = "0.0.9"
+version = "0.0.10"
 dependencies = [
  "proc-macro2",
  "quote",
