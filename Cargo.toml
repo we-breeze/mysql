@@ -1,6 +1,6 @@
 [package]
 name = "brz-mysql"
-version = "0.0.9"
+version = "0.0.10"
 edition = "2024"
 description = "Breeze platform MySQL access capability: owns the raw sqlx driver and MySQL connection/pool lifecycle."
 license = "MIT OR Apache-2.0"
