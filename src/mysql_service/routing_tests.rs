@@ -38,10 +38,10 @@ async fn one_service_type_keeps_policy_and_key_bindings_independent() {
         "SELECT * FROM `tasks_0102`"
     );
     drop(keyed.clone());
-    assert!(!plain.pool.is_closed());
+    assert!(!plain.master_pool.is_closed());
     keyed.close().await;
     for service in [&plain, &routed, &keyed, &rebound] {
-        assert!(service.pool.is_closed());
+        assert!(service.master_pool.is_closed());
     }
 }
 
