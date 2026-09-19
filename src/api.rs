@@ -34,6 +34,8 @@ pub enum MysqlError {
     EncodeArgument { position: usize, message: String },
     #[error("MySQL connection acquisition timed out")]
     PoolTimedOut,
+    #[error("MySQL query timed out")]
+    QueryTimedOut,
     #[error("MySQL row was not found")]
     RowNotFound,
     #[error("MySQL column {0:?} was not found")]
@@ -92,6 +94,7 @@ pub struct MysqlServiceOptions {
     pub max_connections: u32,
     pub min_connections: u32,
     pub acquire_timeout: Duration,
+    pub query_timeout: Duration,
     pub idle_timeout: Option<Duration>,
     pub max_lifetime: Option<Duration>,
     pub slow_acquire_threshold: Duration,
@@ -103,9 +106,10 @@ pub struct MysqlServiceOptions {
 impl Default for MysqlServiceOptions {
     fn default() -> Self {
         Self {
-            max_connections: 30,
+            max_connections: 32,
             min_connections: 0,
-            acquire_timeout: Duration::from_secs(30),
+            acquire_timeout: Duration::from_secs(2),
+            query_timeout: Duration::from_secs(3),
             idle_timeout: Some(Duration::from_secs(10 * 60)),
             max_lifetime: Some(Duration::from_secs(60 * 60)),
             slow_acquire_threshold: Duration::from_secs(2),
@@ -132,6 +136,12 @@ impl MysqlServiceOptions {
     #[must_use]
     pub fn with_acquire_timeout(mut self, value: Duration) -> Self {
         self.acquire_timeout = value;
+        self
+    }
+
+    #[must_use]
+    pub fn with_query_timeout(mut self, value: Duration) -> Self {
+        self.query_timeout = value;
         self
     }
 

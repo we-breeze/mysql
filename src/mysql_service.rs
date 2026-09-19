@@ -1,6 +1,6 @@
 //! SQLx-backed implementation of the public MySQL contract.
 
-use std::{borrow::Cow, str::FromStr};
+use std::{borrow::Cow, future::Future, str::FromStr};
 
 use async_stream::stream;
 use futures_core::Stream;
@@ -19,12 +19,16 @@ use crate::{
 };
 
 /// SQLx-backed MySQL service with optional per-handle table routing.
-/// Clones and handles created by `with_route`/`route` share one connection pool.
+/// Clones and handles created by `with_route`/`route` share the same pools.
+/// Writes and transactions use the master pool; reads use the optional slave
+/// pool and fall back to the master pool when no slave is configured.
 /// Plain SQL bypasses routing; templated SQL uses the handle's policy and key.
 #[derive(Clone, Debug)]
 pub struct MysqlService {
-    pool: MySqlPool,
+    master_pool: MySqlPool,
+    slave_pool: Option<MySqlPool>,
     metrics: MysqlMetrics,
+    query_timeout: std::time::Duration,
     routing: Option<QueryRouting>,
 }
 
@@ -33,19 +37,77 @@ impl MysqlService {
         Self::connect_with_options(url, MysqlServiceOptions::default()).await
     }
 
+    pub async fn connect_named(url: &str, name: &str) -> MysqlResult<Self> {
+        Self::connect_named_with_options(url, name, MysqlServiceOptions::default()).await
+    }
+
     pub async fn connect_with_options(
         url: &str,
         options: MysqlServiceOptions,
     ) -> MysqlResult<Self> {
-        let (connect_options, pool_options) = build_options(url, &options)?;
-        let metrics = MysqlMetrics::new(connect_options.get_host());
-        let pool = pool_options
-            .connect_with(connect_options)
+        Self::connect_with_metric_name(url, None, options).await
+    }
+
+    /// Connects with an explicit stable metric prefix.
+    pub async fn connect_named_with_options(
+        url: &str,
+        name: &str,
+        options: MysqlServiceOptions,
+    ) -> MysqlResult<Self> {
+        Self::connect_with_metric_name(url, Some(name), options).await
+    }
+
+    async fn connect_with_metric_name(
+        url: &str,
+        name: Option<&str>,
+        options: MysqlServiceOptions,
+    ) -> MysqlResult<Self> {
+        Self::connect_read_write_with_metric_name(url, None, name, options).await
+    }
+
+    /// Connects separate master and slave pools. Writes and transactions use
+    /// `master_url`; reads use `slave_url`.
+    pub async fn connect_read_write_with_options(
+        master_url: &str,
+        slave_url: &str,
+        options: MysqlServiceOptions,
+    ) -> MysqlResult<Self> {
+        Self::connect_read_write_with_metric_name(master_url, Some(slave_url), None, options).await
+    }
+
+    async fn connect_read_write_with_metric_name(
+        master_url: &str,
+        slave_url: Option<&str>,
+        name: Option<&str>,
+        options: MysqlServiceOptions,
+    ) -> MysqlResult<Self> {
+        let (master_options, master_pool_options) = build_options(master_url, &options)?;
+        let slave = slave_url
+            .map(|url| build_options(url, &options))
+            .transpose()?;
+        validate_metric_name(name)?;
+        let metrics = mysql_metrics(&master_options, name);
+        let master_pool = master_pool_options
+            .connect_with(master_options)
             .await
             .map_err(map_sqlx_error)?;
+        let slave_pool = match slave {
+            Some((connect_options, pool_options)) => {
+                match pool_options.connect_with(connect_options).await {
+                    Ok(pool) => Some(pool),
+                    Err(error) => {
+                        master_pool.close().await;
+                        return Err(map_sqlx_error(error));
+                    }
+                }
+            }
+            None => None,
+        };
         Ok(Self {
-            pool,
+            master_pool,
+            slave_pool,
             metrics,
+            query_timeout: options.query_timeout,
             routing: None,
         })
     }
@@ -54,11 +116,59 @@ impl MysqlService {
         Self::connect_lazy_with_options(url, MysqlServiceOptions::default())
     }
 
+    pub fn connect_lazy_named(url: &str, name: &str) -> MysqlResult<Self> {
+        Self::connect_lazy_named_with_options(url, name, MysqlServiceOptions::default())
+    }
+
     pub fn connect_lazy_with_options(url: &str, options: MysqlServiceOptions) -> MysqlResult<Self> {
-        let (connect_options, pool_options) = build_options(url, &options)?;
+        Self::connect_lazy_with_metric_name(url, None, options)
+    }
+
+    /// Lazily connects with an explicit stable metric prefix.
+    pub fn connect_lazy_named_with_options(
+        url: &str,
+        name: &str,
+        options: MysqlServiceOptions,
+    ) -> MysqlResult<Self> {
+        Self::connect_lazy_with_metric_name(url, Some(name), options)
+    }
+
+    fn connect_lazy_with_metric_name(
+        url: &str,
+        name: Option<&str>,
+        options: MysqlServiceOptions,
+    ) -> MysqlResult<Self> {
+        Self::connect_lazy_read_write_with_metric_name(url, None, name, options)
+    }
+
+    /// Lazily creates separate master and slave pools. No network connection
+    /// is opened until the corresponding role receives its first request.
+    pub fn connect_lazy_read_write_with_options(
+        master_url: &str,
+        slave_url: &str,
+        options: MysqlServiceOptions,
+    ) -> MysqlResult<Self> {
+        Self::connect_lazy_read_write_with_metric_name(master_url, Some(slave_url), None, options)
+    }
+
+    fn connect_lazy_read_write_with_metric_name(
+        master_url: &str,
+        slave_url: Option<&str>,
+        name: Option<&str>,
+        options: MysqlServiceOptions,
+    ) -> MysqlResult<Self> {
+        let (master_options, master_pool_options) = build_options(master_url, &options)?;
+        let slave = slave_url
+            .map(|url| build_options(url, &options))
+            .transpose()?;
+        validate_metric_name(name)?;
         Ok(Self {
-            metrics: MysqlMetrics::new(connect_options.get_host()),
-            pool: pool_options.connect_lazy_with(connect_options),
+            metrics: mysql_metrics(&master_options, name),
+            master_pool: master_pool_options.connect_lazy_with(master_options),
+            slave_pool: slave.map(|(connect_options, pool_options)| {
+                pool_options.connect_lazy_with(connect_options)
+            }),
+            query_timeout: options.query_timeout,
             routing: None,
         })
     }
@@ -67,8 +177,10 @@ impl MysqlService {
     /// Rebinding replaces the policy and clears any explicit key.
     pub fn with_route<R: MysqlRouting + 'static>(&self, routing: R) -> Self {
         Self {
-            pool: self.pool.clone(),
+            master_pool: self.master_pool.clone(),
+            slave_pool: self.slave_pool.clone(),
             metrics: self.metrics,
+            query_timeout: self.query_timeout,
             routing: Some(QueryRouting::new(routing)),
         }
     }
@@ -78,8 +190,10 @@ impl MysqlService {
     /// no-op; templated SQL still requires `with_route`, and plain SQL is unchanged.
     pub fn route<K: MysqlRouteKey>(&self, key: K) -> Self {
         Self {
-            pool: self.pool.clone(),
+            master_pool: self.master_pool.clone(),
+            slave_pool: self.slave_pool.clone(),
             metrics: self.metrics,
+            query_timeout: self.query_timeout,
             routing: self.routing.as_ref().map(|routing| routing.with_key(key)),
         }
     }
@@ -89,15 +203,15 @@ impl MysqlService {
         S: AsRef<str> + Send,
         A: MysqlArgs + Send,
     {
-        let observation = Observation::new(self.metrics.update);
-        let result = async {
+        let observation = Observation::query(Some(self.metrics.write), sql.as_ref());
+        let result = run_with_timeout(self.query_timeout, async {
             let (sql, arguments) = prepare_query(sql.as_ref(), arguments, self.routing.as_ref())?;
             sqlx::query_with::<MySql, _>(sql.as_ref(), arguments)
-                .execute(&self.pool)
+                .execute(&self.master_pool)
                 .await
                 .map(execution)
                 .map_err(map_sqlx_error)
-        }
+        })
         .await;
         observation.finish(result.is_ok());
         result
@@ -109,16 +223,16 @@ impl MysqlService {
         A: MysqlArgs + Send,
         T: FromMysqlRow + Send,
     {
-        let observation = Observation::new(self.metrics.get);
-        let result = async {
+        let observation = Observation::query(Some(self.metrics.read), sql.as_ref());
+        let result = run_with_timeout(self.query_timeout, async {
             let (sql, arguments) = prepare_query(sql.as_ref(), arguments, self.routing.as_ref())?;
             sqlx::query_with::<MySql, _>(sql.as_ref(), arguments)
-                .fetch_optional(&self.pool)
+                .fetch_optional(self.read_pool())
                 .await
                 .map_err(map_sqlx_error)?
                 .map(decode_row)
                 .transpose()
-        }
+        })
         .await;
         observation.finish(result.is_ok());
         result
@@ -130,17 +244,17 @@ impl MysqlService {
         A: MysqlArgs + Send,
         T: FromMysqlRow + Send,
     {
-        let observation = Observation::new(self.metrics.get);
-        let result = async {
+        let observation = Observation::query(Some(self.metrics.read), sql.as_ref());
+        let result = run_with_timeout(self.query_timeout, async {
             let (sql, arguments) = prepare_query(sql.as_ref(), arguments, self.routing.as_ref())?;
             sqlx::query_with::<MySql, _>(sql.as_ref(), arguments)
-                .fetch_optional(&self.pool)
+                .fetch_optional(self.read_pool())
                 .await
                 .map_err(map_sqlx_error)?
                 .map(decode_row)
                 .transpose()?
                 .ok_or(MysqlError::RowNotFound)
-        }
+        })
         .await;
         observation.finish(result.is_ok());
         result
@@ -158,7 +272,8 @@ impl MysqlService {
         T: FromMysqlRow + Send + 'service,
     {
         stream! {
-            let observation = Observation::new(self.metrics.list);
+            let observation = Observation::query(Some(self.metrics.read), sql.as_ref());
+            let deadline = tokio::time::Instant::now() + self.query_timeout;
             let mut success = true;
             let (sql, arguments) = match prepare_query(
                 sql.as_ref(),
@@ -171,12 +286,22 @@ impl MysqlService {
                     return;
                 }
             };
-            let rows = sqlx::query_with::<MySql, _>(sql.as_ref(), arguments).fetch(&self.pool);
+            let rows = sqlx::query_with::<MySql, _>(sql.as_ref(), arguments).fetch(self.read_pool());
             pin_mut!(rows);
-            while let Some(row) = rows.next().await {
-                let result = row.map_err(map_sqlx_error).and_then(decode_row);
-                success &= result.is_ok();
-                yield result;
+            loop {
+                match tokio::time::timeout_at(deadline, rows.next()).await {
+                    Ok(Some(row)) => {
+                        let result = row.map_err(map_sqlx_error).and_then(decode_row);
+                        success &= result.is_ok();
+                        yield result;
+                    }
+                    Ok(None) => break,
+                    Err(_) => {
+                        observation.finish(false);
+                        yield Err(MysqlError::QueryTimedOut);
+                        return;
+                    }
+                }
             }
             observation.finish(success);
         }
@@ -206,8 +331,8 @@ impl MysqlService {
             ) -> MysqlResult<T>
             + Send,
     {
-        let observation = Observation::new(self.metrics.transaction);
-        let result = async {
+        let observation = Observation::transaction(self.metrics.transaction);
+        let result = run_with_timeout(self.query_timeout, async {
             let mut transaction = self.begin(self.routing.clone()).await?;
             match operation(&mut transaction).await {
                 Ok(value) => {
@@ -222,43 +347,63 @@ impl MysqlService {
                     }),
                 },
             }
-        }
+        })
         .await;
         observation.finish(result.is_ok());
         result
     }
 
     pub async fn ping(&self) -> MysqlResult<()> {
-        sqlx::query("SELECT 1")
-            .execute(&self.pool)
-            .await
-            .map(|_| ())
-            .map_err(map_sqlx_error)
+        run_with_timeout(self.query_timeout, async {
+            sqlx::query("SELECT 1")
+                .execute(&self.master_pool)
+                .await
+                .map(|_| ())
+                .map_err(map_sqlx_error)
+        })
+        .await
     }
 
     pub fn pool_stats(&self) -> crate::PoolStats {
-        crate::PoolStats {
-            size: self.pool.size(),
-            idle: self.pool.num_idle(),
-            max_connections: self.pool.options().get_max_connections(),
-        }
+        pool_stats(&self.master_pool)
     }
 
-    /// Close the pool shared by every clone and routed handle.
+    /// Returns slave pool statistics, or master statistics when reads share
+    /// the master pool.
+    pub fn read_pool_stats(&self) -> crate::PoolStats {
+        pool_stats(self.read_pool())
+    }
+
+    fn read_pool(&self) -> &MySqlPool {
+        self.slave_pool.as_ref().unwrap_or(&self.master_pool)
+    }
+
+    /// Close every pool shared by all clones and routed handles.
     pub async fn close(&self) {
-        self.pool.close().await;
+        if let Some(pool) = &self.slave_pool {
+            pool.close().await;
+        }
+        self.master_pool.close().await;
     }
 
     async fn begin(&self, route: Option<QueryRouting>) -> MysqlResult<MysqlTransactionService> {
-        self.pool
+        self.master_pool
             .begin()
             .await
             .map(|inner| MysqlTransactionService {
                 inner: Some(inner),
-                metrics: self.metrics,
                 route,
+                query_timeout: self.query_timeout,
             })
             .map_err(map_sqlx_error)
+    }
+}
+
+fn pool_stats(pool: &MySqlPool) -> crate::PoolStats {
+    crate::PoolStats {
+        size: pool.size(),
+        idle: pool.num_idle(),
+        max_connections: pool.options().get_max_connections(),
     }
 }
 
@@ -334,8 +479,8 @@ impl Mysql for MysqlService {
 /// Scoped transaction value created only by MysqlService::with_transaction.
 pub struct MysqlTransactionService {
     inner: Option<sqlx::Transaction<'static, MySql>>,
-    metrics: MysqlMetrics,
     route: Option<QueryRouting>,
+    query_timeout: std::time::Duration,
 }
 
 impl std::fmt::Debug for MysqlTransactionService {
@@ -387,15 +532,15 @@ impl MysqlTransaction for MysqlTransactionService {
         S: AsRef<str> + Send,
         A: MysqlArgs + Send,
     {
-        let observation = Observation::new(self.metrics.update);
-        let result = async {
+        let observation = Observation::query(None, sql.as_ref());
+        let result = run_with_timeout(self.query_timeout, async {
             let (sql, arguments) = prepare_query(sql.as_ref(), arguments, self.route.as_ref())?;
             sqlx::query_with::<MySql, _>(sql.as_ref(), arguments)
                 .execute(&mut **self.inner()?)
                 .await
                 .map(execution)
                 .map_err(map_sqlx_error)
-        }
+        })
         .await;
         observation.finish(result.is_ok());
         result
@@ -407,8 +552,8 @@ impl MysqlTransaction for MysqlTransactionService {
         A: MysqlArgs + Send,
         T: FromMysqlRow + Send,
     {
-        let observation = Observation::new(self.metrics.get);
-        let result = async {
+        let observation = Observation::query(None, sql.as_ref());
+        let result = run_with_timeout(self.query_timeout, async {
             let (sql, arguments) = prepare_query(sql.as_ref(), arguments, self.route.as_ref())?;
             sqlx::query_with::<MySql, _>(sql.as_ref(), arguments)
                 .fetch_optional(&mut **self.inner()?)
@@ -416,7 +561,7 @@ impl MysqlTransaction for MysqlTransactionService {
                 .map_err(map_sqlx_error)?
                 .map(decode_row)
                 .transpose()
-        }
+        })
         .await;
         observation.finish(result.is_ok());
         result
@@ -428,8 +573,8 @@ impl MysqlTransaction for MysqlTransactionService {
         A: MysqlArgs + Send,
         T: FromMysqlRow + Send,
     {
-        let observation = Observation::new(self.metrics.get);
-        let result = async {
+        let observation = Observation::query(None, sql.as_ref());
+        let result = run_with_timeout(self.query_timeout, async {
             let (sql, arguments) = prepare_query(sql.as_ref(), arguments, self.route.as_ref())?;
             sqlx::query_with::<MySql, _>(sql.as_ref(), arguments)
                 .fetch_optional(&mut **self.inner()?)
@@ -438,7 +583,7 @@ impl MysqlTransaction for MysqlTransactionService {
                 .map(decode_row)
                 .transpose()?
                 .ok_or(MysqlError::RowNotFound)
-        }
+        })
         .await;
         observation.finish(result.is_ok());
         result
@@ -455,7 +600,8 @@ impl MysqlTransaction for MysqlTransactionService {
         T: FromMysqlRow + Send + 'transaction,
     {
         stream! {
-            let observation = Observation::new(self.metrics.list);
+            let observation = Observation::query(None, sql.as_ref());
+            let deadline = tokio::time::Instant::now() + self.query_timeout;
             let mut success = true;
             let (sql, arguments) = match prepare_query(
                 sql.as_ref(),
@@ -478,10 +624,20 @@ impl MysqlTransaction for MysqlTransactionService {
             let rows =
                 sqlx::query_with::<MySql, _>(sql.as_ref(), arguments).fetch(&mut **transaction);
             pin_mut!(rows);
-            while let Some(row) = rows.next().await {
-                let result = row.map_err(map_sqlx_error).and_then(decode_row);
-                success &= result.is_ok();
-                yield result;
+            loop {
+                match tokio::time::timeout_at(deadline, rows.next()).await {
+                    Ok(Some(row)) => {
+                        let result = row.map_err(map_sqlx_error).and_then(decode_row);
+                        success &= result.is_ok();
+                        yield result;
+                    }
+                    Ok(None) => break,
+                    Err(_) => {
+                        observation.finish(false);
+                        yield Err(MysqlError::QueryTimedOut);
+                        return;
+                    }
+                }
             }
             observation.finish(success);
         }
@@ -514,6 +670,15 @@ where
     let rendered = render_query(sql, &arguments, route)?;
     let encoded = encode_arguments(arguments)?;
     Ok((rendered, encoded))
+}
+
+async fn run_with_timeout<T>(
+    timeout: std::time::Duration,
+    future: impl Future<Output = MysqlResult<T>>,
+) -> MysqlResult<T> {
+    tokio::time::timeout(timeout, future)
+        .await
+        .map_err(|_| MysqlError::QueryTimedOut)?
 }
 
 /// Plain statements bypass table routing, including inside a sharded transaction.
@@ -563,6 +728,9 @@ fn validate_options(options: &MysqlServiceOptions) -> MysqlResult<()> {
     if options.acquire_timeout.is_zero() {
         return Err(invalid("acquire_timeout must be greater than zero"));
     }
+    if options.query_timeout.is_zero() {
+        return Err(invalid("query_timeout must be greater than zero"));
+    }
     if options.idle_timeout.is_some_and(|value| value.is_zero()) {
         return Err(invalid("idle_timeout must be greater than zero when set"));
     }
@@ -581,6 +749,26 @@ fn validate_options(options: &MysqlServiceOptions) -> MysqlResult<()> {
         return Err(invalid("charset must not be empty"));
     }
     Ok(())
+}
+
+fn validate_metric_name(name: Option<&str>) -> MysqlResult<()> {
+    if name.is_some_and(|name| name.trim().is_empty()) {
+        return Err(MysqlError::InvalidConfig {
+            reason: "metric name must not be empty when set".to_string(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(feature = "metrics")]
+fn mysql_metrics(connect_options: &MySqlConnectOptions, name: Option<&str>) -> MysqlMetrics {
+    let name = name.map_or_else(|| connect_options.get_port().to_string(), str::to_owned);
+    MysqlMetrics::new(&name)
+}
+
+#[cfg(not(feature = "metrics"))]
+fn mysql_metrics(_connect_options: &MySqlConnectOptions, _name: Option<&str>) -> MysqlMetrics {
+    MysqlMetrics::new("")
 }
 
 fn execution(result: sqlx::mysql::MySqlQueryResult) -> MysqlExecution {
@@ -627,6 +815,7 @@ mod tests {
             max_connections: 4,
             min_connections: 0,
             acquire_timeout: Duration::from_secs(2),
+            query_timeout: Duration::from_secs(3),
             idle_timeout: Some(Duration::from_secs(60)),
             max_lifetime: Some(Duration::from_secs(300)),
             slow_acquire_threshold: Duration::from_millis(500),
@@ -648,6 +837,29 @@ mod tests {
         service.close().await;
     }
 
+    #[tokio::test]
+    async fn read_write_service_builds_independent_lazy_pools() {
+        let service = MysqlService::connect_lazy_read_write_with_options(
+            "mysql://master:master-secret@127.0.0.1:3306/wegent",
+            "mysql://slave:slave-secret@127.0.0.2:3306/wegent",
+            options(),
+        )
+        .unwrap();
+        assert!(service.slave_pool.is_some());
+        assert_eq!(service.pool_stats().size, 0);
+        assert_eq!(service.read_pool_stats().size, 0);
+        assert_eq!(service.pool_stats().max_connections, 4);
+        assert_eq!(service.read_pool_stats().max_connections, 4);
+        service.close().await;
+    }
+
+    #[test]
+    fn default_pool_is_lazy_and_bounded() {
+        let options = MysqlServiceOptions::default();
+        assert_eq!(options.min_connections, 0);
+        assert_eq!(options.max_connections, 32);
+    }
+
     #[test]
     fn invalid_url_error_is_credential_safe() {
         let error = MysqlService::connect_lazy_with_options(
@@ -657,6 +869,35 @@ mod tests {
         .unwrap_err();
         assert!(!error.to_string().contains("top-secret"));
         assert!(!format!("{error:?}").contains("top-secret"));
+    }
+
+    #[cfg(feature = "metrics")]
+    #[tokio::test]
+    async fn metric_name_defaults_to_port_and_accepts_an_override() {
+        let by_port = MysqlService::connect_lazy("mysql://user:secret@127.0.0.1:43306/db").unwrap();
+        let named =
+            MysqlService::connect_lazy_named("mysql://user:secret@127.0.0.1:43307/db", "primary")
+                .unwrap();
+        let mut names = Vec::new();
+        brz_metrics::visit(|name, kind, _| {
+            if kind == "MYSQL" && (name.starts_with("43306_") || name.starts_with("primary_")) {
+                names.push(name.to_owned());
+            }
+        });
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "43306_r",
+                "43306_t",
+                "43306_w",
+                "primary_r",
+                "primary_t",
+                "primary_w"
+            ]
+        );
+        by_port.close().await;
+        named.close().await;
     }
 }
 

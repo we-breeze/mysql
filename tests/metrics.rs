@@ -1,11 +1,11 @@
-#![cfg(feature = "integration-tests")]
+#![cfg(all(feature = "integration-tests", feature = "metrics"))]
 
 use brz_mysql::{MysqlError, MysqlService, MysqlTransaction};
 use futures_util::StreamExt;
 
-fn counts(host: &str) -> [(u64, u64); 4] {
-    let names = ["get", "list", "update", "transaction"].map(|op| format!("{host}_{op}"));
-    let mut counts = [(0, 0); 4];
+fn counts(name: &str) -> [(u64, u64); 3] {
+    let names = ["r", "w", "t"].map(|suffix| format!("{name}_{suffix}"));
+    let mut counts = [(0, 0); 3];
     let mut found = 0;
     brz_metrics::visit(|name, kind, snapshot| {
         if let Some(index) = names.iter().position(|expected| expected == name) {
@@ -14,7 +14,7 @@ fn counts(host: &str) -> [(u64, u64); 4] {
             found += 1;
         }
     });
-    assert_eq!(found, 4);
+    assert_eq!(found, 3);
     counts
 }
 
@@ -24,11 +24,12 @@ async fn operations_share_host_handles_and_record_once() {
         return;
     };
     let options: sqlx::mysql::MySqlConnectOptions = url.parse().unwrap();
+    let port = options.get_port().to_string();
     let host = options.get_host();
     let mysql = MysqlService::connect(&url).await.unwrap();
     let other =
         MysqlService::connect_lazy(&format!("mysql://different:secret@{host}/other_db")).unwrap();
-    assert_eq!(counts(host), [(0, 0); 4]);
+    assert_eq!(counts(&port), [(0, 0); 3]);
     let _: i64 = mysql.clone().fetch_one("SELECT 1", ()).await.unwrap();
     let missing: Option<i64> = mysql
         .fetch_optional("SELECT 1 FROM DUAL WHERE FALSE", ())
@@ -47,10 +48,10 @@ async fn operations_share_host_handles_and_record_once() {
             .await
             .is_err()
     );
-    assert_eq!(counts(host)[0], (4, 2));
+    assert_eq!(counts(&port)[0], (4, 2));
 
     drop(mysql.fetch::<_, _, i64>("SELECT 1", ()));
-    assert_eq!(counts(host)[1], (0, 0));
+    assert_eq!(counts(&port)[0], (4, 2));
     let rows: Vec<i64> = mysql
         .fetch_all("SELECT 1 UNION ALL SELECT 2", ())
         .await
@@ -66,10 +67,10 @@ async fn operations_share_host_handles_and_record_once() {
             .await
             .is_err()
     );
-    assert_eq!(counts(host)[1], (3, 2));
+    assert_eq!(counts(&port)[0], (7, 4));
     mysql.execute("SET @metric_test = 1", ()).await.unwrap();
     assert!(mysql.execute("INVALID STATEMENT", ()).await.is_err());
-    assert_eq!(counts(host)[2], (2, 1));
+    assert_eq!(counts(&port)[1], (2, 1));
 
     mysql
         .with_transaction(async |tx| {
@@ -103,7 +104,7 @@ async fn operations_share_host_handles_and_record_once() {
             result = &mut operation => panic!("unexpected completion: {result:?}"),
         }
     }
-    assert_eq!(counts(host), [(6, 3), (4, 2), (3, 1), (3, 2)]);
+    assert_eq!(counts(&port), [(7, 4), (2, 1), (3, 2)]);
     other.close().await;
     mysql.close().await;
 }

@@ -8,7 +8,7 @@ repository = "https://github.com/we-breeze/mysql"
 
 [dependencies]
 async-stream = "0.3"
-brz-metrics = { package = "brz-metrics", version = "=0.0.5" }
+brz-metrics = { package = "brz-metrics", version = "=0.0.6", optional = true }
 brz-mysql-derive = { path = "derive", version = "=0.0.10" }
 bytes = "1.9"
 chrono = "0.4"
@@ -18,10 +18,13 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "mysql", "chrono", "json", "bigdecimal"] }
 thiserror = "2"
-tokio = { version = "1", features = ["macros"] }
+tokio = { version = "1", features = ["macros", "time"] }
+tracing = { version = "0.1", optional = true }
 
 [features]
 integration-tests = []
+metrics = ["dep:brz-metrics"]
+slow-log = ["dep:tracing"]
 
 [lib]
 name = "brz_mysql"

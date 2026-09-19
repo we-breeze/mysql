@@ -57,6 +57,39 @@ mysql
 # Ok::<(), brz_mysql::MysqlError>(())
 ```
 
+To separate reads from writes, construct independent lazy pools. `execute`,
+`ping`, and complete transactions use the master URL; `fetch*` methods outside
+a transaction use the slave URL. The URLs are parsed independently and may use
+different credentials. Omitting the slave pool keeps the original single-pool
+behavior.
+
+```rust,no_run
+let mysql = MysqlService::connect_lazy_read_write_with_options(
+    master_url,
+    slave_url,
+    MysqlServiceOptions::default(),
+)?;
+# Ok::<(), brz_mysql::MysqlError>(())
+```
+
+The default pool bounds are zero minimum connections and 32 maximum
+connections per configured pool.
+
+## Metrics and slow queries
+
+Enable `metrics` to register `MYSQL` metrics named `<name>_r`, `<name>_w`, and
+`<name>_t` for reads, non-read statements, and whole transactions. The default
+name is the connection port. Use `MysqlService::connect_named` or
+`connect_named_with_options` for a custom name. Statements inside a transaction
+are not double-counted as standalone reads or writes.
+Without the feature, the `brz-metrics` dependency and recording code compile out.
+
+Enable `slow-log` to emit statements or transactions taking at least 1 second
+to `breeze.slow`. SQL text is capped at 2 KiB; because literals can contain
+secrets, prefer bound arguments and use an appropriate log-retention policy.
+The positional fields are component, operation, elapsed time, success, and SQL;
+SQL is always the final field.
+
 Arguments are heterogeneous tuples. Implementations exist for tuples up to 16
 items, homogeneous arrays and vectors, primitive numeric values, strings,
 bytes, dates and times, Option<T>, decimal values, and Json<T>. An application
@@ -466,18 +499,17 @@ driver and traffic-framework responsibilities respectively.
 
 ### MySQL 指标
 
-创建连接池时按 URL 的 host 注册四个 `MYSQL` 指标，不包含端口、数据库、用户名或密码；同一 host 的多个连接池共享计数：
+启用 `metrics` 后，创建连接池时注册三个 `MYSQL` 指标；默认名称是 URL 中的端口，也可通过 `connect_named` 系列 API 指定名称：
 
 | 指标 | 操作 |
 | --- | --- |
-| `<host>_get` | `fetch_optional`、`fetch_one` |
-| `<host>_list` | `fetch`、`fetch_all` |
-| `<host>_update` | `execute`，包括插入、更新和删除 |
-| `<host>_transaction` | `with_transaction`，从获取事务连接到提交或回滚完成 |
+| `<name>_r` | 事务外的读请求 |
+| `<name>_w` | 事务外除读请求之外的请求 |
+| `<name>_t` | 完整事务 |
 
-名称只在连接池创建时拼接，查询时使用缓存句柄。计时包含连接等待、SQL 执行和结果解码，沿用资源指标的 50ms 慢调用阈值。事务内语句同时计入各自操作指标；`ping` 不计入。
+名称只在连接池创建时拼接，请求处理时使用缓存句柄。事务内语句不重复计入 `_r` 或 `_w`；`ping` 不计入。
 
-每次查询计数一次，列表不会按行重复计数。`fetch_optional` 返回 `None` 属于成功，`fetch_one` 的 `RowNotFound` 属于失败。流第一次被 poll 时开始计时，读至结束且没有错误才算成功；开始后提前丢弃的流、取消的调用，以及回滚的事务均记为失败。尚未 poll 的 future/stream 不计数。分片路由在进入底层查询之前发生的解析错误不计入数据库调用指标。
+每次请求计数一次，列表不会按行重复计数。`fetch_optional` 返回 `None` 属于成功，`fetch_one` 的 `RowNotFound` 属于失败。流第一次被 poll 时开始计时，读至结束且没有错误才算成功；开始后提前丢弃的流、取消的调用，以及回滚的事务均记为失败。尚未 poll 的 future/stream 不计数。分片路由在进入底层查询之前发生的解析错误不计入数据库调用指标。
 
 ## Releases
 

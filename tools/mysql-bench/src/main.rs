@@ -21,6 +21,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_connections,
         min_connections: 0,
         acquire_timeout: Duration::from_secs(5),
+        query_timeout: Duration::from_secs(5),
         idle_timeout: Some(Duration::from_secs(60)),
         max_lifetime: Some(Duration::from_secs(300)),
         slow_acquire_threshold: Duration::from_millis(500),

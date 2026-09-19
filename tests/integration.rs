@@ -15,6 +15,7 @@ fn options() -> MysqlServiceOptions {
         max_connections: 4,
         min_connections: 0,
         acquire_timeout: Duration::from_secs(5),
+        query_timeout: Duration::from_secs(5),
         idle_timeout: Some(Duration::from_secs(60)),
         max_lifetime: Some(Duration::from_secs(300)),
         slow_acquire_threshold: Duration::from_millis(500),
@@ -197,6 +198,37 @@ async fn derive_and_json_roundtrip_against_mysql_57() {
 #[derive(Debug, FromMysqlRow)]
 struct IdRow {
     id: i64,
+}
+
+#[tokio::test]
+async fn read_write_service_routes_operations_to_their_role_pools() {
+    let Some(url) = test_url() else {
+        eprintln!("skipping: BREEZE_MYSQL_TEST_URL not set");
+        return;
+    };
+    let service = MysqlService::connect_lazy_read_write_with_options(&url, &url, options())
+        .expect("valid master and slave URLs");
+    assert_eq!(service.pool_stats().size, 0);
+    assert_eq!(service.read_pool_stats().size, 0);
+
+    service.execute("SELECT 1", ()).await.unwrap();
+    assert!(service.pool_stats().size > 0);
+    assert_eq!(service.read_pool_stats().size, 0);
+
+    let row: IdRow = service.fetch_one("SELECT 1 AS id", ()).await.unwrap();
+    assert_eq!(row.id, 1);
+    assert!(service.read_pool_stats().size > 0);
+
+    let transaction_row = service
+        .with_transaction(async |transaction| {
+            transaction
+                .fetch_one::<_, _, IdRow>("SELECT 2 AS id", ())
+                .await
+        })
+        .await
+        .unwrap();
+    assert_eq!(transaction_row.id, 2);
+    service.close().await;
 }
 
 #[tokio::test]
