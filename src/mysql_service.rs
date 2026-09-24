@@ -204,7 +204,7 @@ impl MysqlService {
         A: MysqlArgs + Send,
     {
         let observation = Observation::query(Some(self.metrics.write), sql.as_ref());
-        let result = run_with_timeout(self.query_timeout, async {
+        let result = run_with_timeout(self.query_timeout, async move {
             let (sql, arguments) = prepare_query(sql.as_ref(), arguments, self.routing.as_ref())?;
             sqlx::query_with::<MySql, _>(sql.as_ref(), arguments)
                 .execute(&self.master_pool)
@@ -224,7 +224,7 @@ impl MysqlService {
         T: FromMysqlRow + Send,
     {
         let observation = Observation::query(Some(self.metrics.read), sql.as_ref());
-        let result = run_with_timeout(self.query_timeout, async {
+        let result = run_with_timeout(self.query_timeout, async move {
             let (sql, arguments) = prepare_query(sql.as_ref(), arguments, self.routing.as_ref())?;
             sqlx::query_with::<MySql, _>(sql.as_ref(), arguments)
                 .fetch_optional(self.read_pool())
@@ -245,7 +245,7 @@ impl MysqlService {
         T: FromMysqlRow + Send,
     {
         let observation = Observation::query(Some(self.metrics.read), sql.as_ref());
-        let result = run_with_timeout(self.query_timeout, async {
+        let result = run_with_timeout(self.query_timeout, async move {
             let (sql, arguments) = prepare_query(sql.as_ref(), arguments, self.routing.as_ref())?;
             sqlx::query_with::<MySql, _>(sql.as_ref(), arguments)
                 .fetch_optional(self.read_pool())
@@ -332,7 +332,7 @@ impl MysqlService {
             + Send,
     {
         let observation = Observation::transaction(self.metrics.transaction);
-        let result = run_with_timeout(self.query_timeout, async {
+        let result = run_with_timeout(self.query_timeout, async move {
             let mut transaction = self.begin(self.routing.clone()).await?;
             match operation(&mut transaction).await {
                 Ok(value) => {
@@ -354,7 +354,7 @@ impl MysqlService {
     }
 
     pub async fn ping(&self) -> MysqlResult<()> {
-        run_with_timeout(self.query_timeout, async {
+        run_with_timeout(self.query_timeout, async move {
             sqlx::query("SELECT 1")
                 .execute(&self.master_pool)
                 .await
@@ -417,7 +417,6 @@ impl Mysql for MysqlService {
     fn route<K: MysqlRouteKey>(&self, key: K) -> Self {
         MysqlService::route(self, key)
     }
-
     async fn execute<S, A>(&self, sql: S, arguments: A) -> MysqlResult<MysqlExecution>
     where
         S: AsRef<str> + Send,
@@ -425,7 +424,6 @@ impl Mysql for MysqlService {
     {
         MysqlService::execute(self, sql, arguments).await
     }
-
     async fn fetch_optional<S, A, T>(&self, sql: S, arguments: A) -> MysqlResult<Option<T>>
     where
         S: AsRef<str> + Send,
@@ -434,7 +432,6 @@ impl Mysql for MysqlService {
     {
         MysqlService::fetch_optional(self, sql, arguments).await
     }
-
     async fn fetch_one<S, A, T>(&self, sql: S, arguments: A) -> MysqlResult<T>
     where
         S: AsRef<str> + Send,
@@ -456,7 +453,6 @@ impl Mysql for MysqlService {
     {
         MysqlService::fetch(self, sql, arguments)
     }
-
     async fn fetch_all<S, A, T>(&self, sql: S, arguments: A) -> MysqlResult<Vec<T>>
     where
         S: AsRef<str> + Send,

@@ -1,5 +1,6 @@
 //! Application-facing MySQL contract.
 
+use std::future::Future;
 use std::time::Duration;
 
 use futures_core::Stream;
@@ -192,18 +193,30 @@ pub trait Mysql: Send + Sync {
     /// this is a no-op, as on `MysqlService`.
     fn route<K: MysqlRouteKey>(&self, key: K) -> Self;
 
-    async fn execute<S, A>(&self, sql: S, arguments: A) -> MysqlResult<MysqlExecution>
+    fn execute<S, A>(
+        &self,
+        sql: S,
+        arguments: A,
+    ) -> impl Future<Output = MysqlResult<MysqlExecution>> + Send
     where
         S: AsRef<str> + Send,
         A: MysqlArgs + Send;
 
-    async fn fetch_optional<S, A, T>(&self, sql: S, arguments: A) -> MysqlResult<Option<T>>
+    fn fetch_optional<S, A, T>(
+        &self,
+        sql: S,
+        arguments: A,
+    ) -> impl Future<Output = MysqlResult<Option<T>>> + Send
     where
         S: AsRef<str> + Send,
         A: MysqlArgs + Send,
         T: FromMysqlRow + Send;
 
-    async fn fetch_one<S, A, T>(&self, sql: S, arguments: A) -> MysqlResult<T>
+    fn fetch_one<S, A, T>(
+        &self,
+        sql: S,
+        arguments: A,
+    ) -> impl Future<Output = MysqlResult<T>> + Send
     where
         S: AsRef<str> + Send,
         A: MysqlArgs + Send,
@@ -219,12 +232,18 @@ pub trait Mysql: Send + Sync {
         A: MysqlArgs + Send + 'service,
         T: FromMysqlRow + Send + 'service;
 
-    async fn fetch_all<S, A, T>(&self, sql: S, arguments: A) -> MysqlResult<Vec<T>>
+    fn fetch_all<S, A, T>(
+        &self,
+        sql: S,
+        arguments: A,
+    ) -> impl Future<Output = MysqlResult<Vec<T>>> + Send
     where
         S: AsRef<str> + Send,
         A: MysqlArgs + Send,
         T: FromMysqlRow + Send;
 
+    /// Not declared `Send`: the returned future awaits the caller-supplied
+    /// closure's future, which carries no `Send` bound of its own.
     async fn with_transaction<T, F>(&self, operation: F) -> MysqlResult<T>
     where
         T: Send,
@@ -267,4 +286,43 @@ pub trait MysqlTransaction: Send {
         S: AsRef<str> + Send,
         A: MysqlArgs + Send,
         T: FromMysqlRow + Send;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::MysqlRow;
+
+    /// The point of declaring `Send` on the statement methods: a consumer can
+    /// rely on it for a *generic* handle. Without the declaration these three
+    /// functions do not compile, because an `async fn` in a trait carries no
+    /// auto-trait information — a concrete implementation's futures being
+    /// `Send` is not visible through the trait.
+    fn execute_is_send<'a, M: Mysql>(
+        mysql: &'a M,
+    ) -> impl Future<Output = MysqlResult<MysqlExecution>> + Send + 'a {
+        mysql.execute("SELECT 1", ())
+    }
+
+    fn fetch_optional_is_send<'a, M: Mysql>(
+        mysql: &'a M,
+    ) -> impl Future<Output = MysqlResult<Option<MysqlRow>>> + Send + 'a {
+        mysql.fetch_optional("SELECT 1", ())
+    }
+
+    fn fetch_all_is_send<'a, M: Mysql>(
+        mysql: &'a M,
+    ) -> impl Future<Output = MysqlResult<Vec<MysqlRow>>> + Send + 'a {
+        mysql.fetch_all("SELECT 1", ())
+    }
+
+    #[test]
+    fn statement_futures_are_send_for_any_handle() {
+        // Compilation is the assertion; the bodies never run.
+        let _ = (
+            execute_is_send::<MysqlService>,
+            fetch_optional_is_send::<MysqlService>,
+            fetch_all_is_send::<MysqlService>,
+        );
+    }
 }
