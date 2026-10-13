@@ -75,6 +75,14 @@ let mysql = MysqlService::connect_lazy_read_write_with_options(
 The default pool bounds are zero minimum connections and 32 maximum
 connections per configured pool.
 
+Prepared statements are not cached. Each execution binds its arguments and closes
+its prepared statement instead of retaining it on the connection. This applies
+to all read/write pools, streaming queries, and transactions, including queries
+with no arguments. Statement caching stays disabled even if the connection URL
+specifies `statement-cache-capacity`. This bounds retained server-side statements
+when dynamic SQL and routed tables produce many distinct queries; repeated
+queries pay the cost of preparing the statement again.
+
 ## Metrics and slow queries
 
 Enable `metrics` to register `MYSQL` metrics named `<name>_r`, `<name>_w`, and

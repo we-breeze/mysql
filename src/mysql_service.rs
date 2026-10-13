@@ -698,6 +698,9 @@ fn build_options(
     validate_options(options)?;
     let connect_options = MySqlConnectOptions::from_str(url)
         .map_err(|_| MysqlError::InvalidUrl)?
+        // Dynamic SQL and table routing otherwise retain up to 100 statements
+        // per connection, exhausting MySQL's server-wide prepared-statement limit.
+        .statement_cache_capacity(0)
         .charset(&options.charset)
         .timezone(options.timezone.clone());
     let pool_options = MySqlPoolOptions::new()
@@ -899,3 +902,6 @@ mod tests {
 
 #[cfg(test)]
 mod routing_tests;
+
+#[cfg(all(test, feature = "integration-tests"))]
+mod statement_cache_tests;
