@@ -1,19 +1,19 @@
 use std::time::Instant;
 
 #[cfg(feature = "metrics")]
-use brz_metrics::Metric;
+use brz_metrics::{MetricType, ResourceMetric, TimingMetric};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct MetricHandle {
     #[cfg(feature = "metrics")]
-    inner: Metric,
+    inner: TimingMetric,
 }
 
 impl MetricHandle {
     #[cfg(feature = "metrics")]
     fn mysql(name: &str) -> Self {
         Self {
-            inner: Metric::mysql(name),
+            inner: TimingMetric::new(MetricType::Mysql(ResourceMetric::Req), name),
         }
     }
 
