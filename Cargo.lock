@@ -121,9 +121,9 @@ dependencies = [
 
 [[package]]
 name = "brz-metrics"
-version = "0.0.9"
+version = "0.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "551aeadb7e58f5222cd7ec97237e10c31191683e12026a105e0d1df8b2c0c5f7"
+checksum = "aa20dbb1124676a11001bf00bfb9e56bd5e24c45ffb4722b2f5342adb4d13c4e"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -131,7 +131,7 @@ dependencies = [
 
 [[package]]
 name = "brz-mysql"
-version = "0.0.16"
+version = "0.0.17"
 dependencies = [
  "async-stream",
  "brz-metrics",
@@ -150,7 +150,7 @@ dependencies = [
 
 [[package]]
 name = "brz-mysql-derive"
-version = "0.0.15"
+version = "0.0.16"
 dependencies = [
  "proc-macro2",
  "quote",

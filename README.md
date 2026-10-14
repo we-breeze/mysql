@@ -14,7 +14,7 @@ routing within one database; it does not implement database sharding or fanout.
 Pin the release tag used by these examples in the consuming application:
 
 ```toml
-mysql = { package = "brz-mysql", version = "0.0.5" }
+mysql = { package = "brz-mysql", version = "0.0.17" }
 ```
 
 Repository routing handles replace the earlier global sharding options.
