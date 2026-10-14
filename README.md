@@ -14,7 +14,7 @@ routing within one database; it does not implement database sharding or fanout.
 Pin the release tag used by these examples in the consuming application:
 
 ```toml
-mysql = { package = "brz-mysql", version = "0.0.17" }
+mysql = { package = "brz-mysql", version = "0.0.18" }
 ```
 
 Repository routing handles replace the earlier global sharding options.
@@ -85,11 +85,13 @@ queries pay the cost of preparing the statement again.
 
 ## Metrics and slow queries
 
-Enable `metrics` to register `MYSQL` metrics named `<name>_r`, `<name>_w`, and
-`<name>_t` for reads, non-read statements, and whole transactions. The default
-name is the connection port. Use `MysqlService::connect_named` or
-`connect_named_with_options` for a custom name. Statements inside a transaction
-are not double-counted as standalone reads or writes.
+Enable `metrics` to eagerly register `MYSQL` handles with business `name`,
+`endpoint="host:port"` and `access="read"`, `"write"`, or `"other"` (whole transactions).
+The default name is the endpoint. `MysqlService::connect_named` and
+`connect_lazy_named` supply an explicit business name. Reads use the configured
+slave endpoint if present; writes and transactions use the master. No MySQL
+connection metrics are collected. Cached handles perform no registration or
+label allocation during request recording.
 Without the feature, the `brz-metrics` dependency and recording code compile out.
 
 Enable `slow-log` to emit statements or transactions taking at least 1 second
@@ -507,15 +509,9 @@ driver and traffic-framework responsibilities respectively.
 
 ### MySQL 指标
 
-启用 `metrics` 后，创建连接池时注册三个 `MYSQL` 指标；默认名称是 URL 中的端口，也可通过 `connect_named` 系列 API 指定名称：
+启用 `metrics` 后，在创建连接池时注册 `MYSQL` 指标。默认名称是 `host:port`，也可通过 `connect_named` 系列 API 指定业务名称。`endpoint` 标签独立保留实际资源地址，`access` 分别为 `read`、`write`、`other`（完整事务）。读指标使用 slave 地址（没有 slave 时使用 master），写和事务使用 master 地址。
 
-| 指标 | 操作 |
-| --- | --- |
-| `<name>_r` | 事务外的读请求 |
-| `<name>_w` | 事务外除读请求之外的请求 |
-| `<name>_t` | 完整事务 |
-
-名称只在连接池创建时拼接，请求处理时使用缓存句柄。事务内语句不重复计入 `_r` 或 `_w`；`ping` 不计入。
+请求处理使用缓存句柄，不拼接名称、不查注册表。事务内语句不重复计入读写请求；`ping` 不计入。不采集 MySQL 连接数。
 
 每次请求计数一次，列表不会按行重复计数。`fetch_optional` 返回 `None` 属于成功，`fetch_one` 的 `RowNotFound` 属于失败。流第一次被 poll 时开始计时，读至结束且没有错误才算成功；开始后提前丢弃的流、取消的调用，以及回滚的事务均记为失败。尚未 poll 的 future/stream 不计数。分片路由在进入底层查询之前发生的解析错误不计入数据库调用指标。
 

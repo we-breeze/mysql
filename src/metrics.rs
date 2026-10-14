@@ -1,7 +1,7 @@
 use std::time::Instant;
 
 #[cfg(feature = "metrics")]
-use brz_metrics::{MetricType, ResourceMetric, TimingMetric};
+use brz_metrics::{MetricAccess, MetricType, ResourceLabels, ResourceMetric, TimingMetric};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct MetricHandle {
@@ -11,9 +11,9 @@ pub(crate) struct MetricHandle {
 
 impl MetricHandle {
     #[cfg(feature = "metrics")]
-    fn mysql(name: &str) -> Self {
+    fn mysql(labels: &ResourceLabels) -> Self {
         Self {
-            inner: TimingMetric::new(MetricType::Mysql(ResourceMetric::Req), name),
+            inner: TimingMetric::new_resource(MetricType::Mysql(ResourceMetric::Req), labels),
         }
     }
 
@@ -34,16 +34,18 @@ pub(crate) struct MysqlMetrics {
 
 impl MysqlMetrics {
     #[cfg(feature = "metrics")]
-    pub(crate) fn new(name: &str) -> Self {
+    pub(crate) fn new(name: Option<&str>, master: &str, slave: &str) -> Self {
+        let master = ResourceLabels::new(name.unwrap_or(master), master);
+        let slave = ResourceLabels::new(name.unwrap_or(slave), slave);
         Self {
-            read: MetricHandle::mysql(&format!("{name}_r")),
-            write: MetricHandle::mysql(&format!("{name}_w")),
-            transaction: MetricHandle::mysql(&format!("{name}_t")),
+            read: MetricHandle::mysql(&slave.with_access(MetricAccess::Read)),
+            write: MetricHandle::mysql(&master.clone().with_access(MetricAccess::Write)),
+            transaction: MetricHandle::mysql(&master.with_access(MetricAccess::Other)),
         }
     }
 
     #[cfg(not(feature = "metrics"))]
-    pub(crate) fn new(_name: &str) -> Self {
+    pub(crate) fn new(_name: Option<&str>, _master: &str, _slave: &str) -> Self {
         Self {
             read: MetricHandle {},
             write: MetricHandle {},

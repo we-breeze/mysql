@@ -86,7 +86,11 @@ impl MysqlService {
             .map(|url| build_options(url, &options))
             .transpose()?;
         validate_metric_name(name)?;
-        let metrics = mysql_metrics(&master_options, name);
+        let metrics = mysql_metrics(
+            &master_options,
+            slave.as_ref().map(|(connect, _)| connect),
+            name,
+        );
         let master_pool = master_pool_options
             .connect_with(master_options)
             .await
@@ -163,7 +167,11 @@ impl MysqlService {
             .transpose()?;
         validate_metric_name(name)?;
         Ok(Self {
-            metrics: mysql_metrics(&master_options, name),
+            metrics: mysql_metrics(
+                &master_options,
+                slave.as_ref().map(|(connect, _)| connect),
+                name,
+            ),
             master_pool: master_pool_options.connect_lazy_with(master_options),
             slave_pool: slave.map(|(connect_options, pool_options)| {
                 pool_options.connect_lazy_with(connect_options)
@@ -759,15 +767,23 @@ fn validate_metric_name(name: Option<&str>) -> MysqlResult<()> {
     Ok(())
 }
 
-#[cfg(feature = "metrics")]
-fn mysql_metrics(connect_options: &MySqlConnectOptions, name: Option<&str>) -> MysqlMetrics {
-    let name = name.map_or_else(|| connect_options.get_port().to_string(), str::to_owned);
-    MysqlMetrics::new(&name)
-}
-
-#[cfg(not(feature = "metrics"))]
-fn mysql_metrics(_connect_options: &MySqlConnectOptions, _name: Option<&str>) -> MysqlMetrics {
-    MysqlMetrics::new("")
+fn mysql_metrics(
+    master: &MySqlConnectOptions,
+    slave: Option<&MySqlConnectOptions>,
+    name: Option<&str>,
+) -> MysqlMetrics {
+    #[cfg(feature = "metrics")]
+    {
+        let endpoint = |options: &MySqlConnectOptions| {
+            format!("{}:{}", options.get_host(), options.get_port())
+        };
+        MysqlMetrics::new(name, &endpoint(master), &endpoint(slave.unwrap_or(master)))
+    }
+    #[cfg(not(feature = "metrics"))]
+    {
+        let _ = (master, slave, name);
+        MysqlMetrics::new(None, "", "")
+    }
 }
 
 fn execution(result: sqlx::mysql::MySqlQueryResult) -> MysqlExecution {
@@ -872,14 +888,14 @@ mod tests {
 
     #[cfg(feature = "metrics")]
     #[tokio::test]
-    async fn metric_name_defaults_to_port_and_accepts_an_override() {
+    async fn metric_name_defaults_to_endpoint_and_accepts_an_override() {
         let by_port = MysqlService::connect_lazy("mysql://user:secret@127.0.0.1:43306/db").unwrap();
         let named =
             MysqlService::connect_lazy_named("mysql://user:secret@127.0.0.1:43307/db", "primary")
                 .unwrap();
         let mut names = Vec::new();
         brz_metrics::visit(|name, kind, _| {
-            if kind == "MYSQL" && (name.starts_with("43306_") || name.starts_with("primary_")) {
+            if kind == "MYSQL" && (name == "127.0.0.1:43306" || name == "primary") {
                 names.push(name.to_owned());
             }
         });
@@ -887,12 +903,12 @@ mod tests {
         assert_eq!(
             names,
             [
-                "43306_r",
-                "43306_t",
-                "43306_w",
-                "primary_r",
-                "primary_t",
-                "primary_w"
+                "127.0.0.1:43306",
+                "127.0.0.1:43306",
+                "127.0.0.1:43306",
+                "primary",
+                "primary",
+                "primary"
             ]
         );
         by_port.close().await;
