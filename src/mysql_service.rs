@@ -155,6 +155,21 @@ impl MysqlService {
         Self::connect_lazy_read_write_with_metric_name(master_url, Some(slave_url), None, options)
     }
 
+    /// Creates lazy master/slave pools sharing one business resource name.
+    pub fn connect_lazy_read_write_named_with_options(
+        master_url: &str,
+        slave_url: &str,
+        name: &str,
+        options: MysqlServiceOptions,
+    ) -> MysqlResult<Self> {
+        Self::connect_lazy_read_write_with_metric_name(
+            master_url,
+            Some(slave_url),
+            Some(name),
+            options,
+        )
+    }
+
     fn connect_lazy_read_write_with_metric_name(
         master_url: &str,
         slave_url: Option<&str>,
@@ -884,6 +899,31 @@ mod tests {
         .unwrap_err();
         assert!(!error.to_string().contains("top-secret"));
         assert!(!format!("{error:?}").contains("top-secret"));
+    }
+
+    #[cfg(feature = "metrics")]
+    #[tokio::test]
+    async fn named_read_write_pools_register_one_name_with_separate_endpoints() {
+        use std::io::Read;
+        let service = MysqlService::connect_lazy_read_write_named_with_options(
+            "mysql://writer:secret@127.0.0.1:43308/db",
+            "mysql://reader:secret@127.0.0.2:43309/db",
+            "named_pair",
+            MysqlServiceOptions::default(),
+        )
+        .unwrap();
+        let mut output = String::new();
+        brz_metrics::PrometheusReader::new()
+            .read_to_string(&mut output)
+            .unwrap();
+        for (endpoint, access) in [
+            ("127.0.0.2:43309", "read"),
+            ("127.0.0.1:43308", "write"),
+            ("127.0.0.1:43308", "other"),
+        ] {
+            assert!(output.contains(&format!("brz_req_total{{type=\"MYSQL\",name=\"named_pair\",endpoint=\"{endpoint}\",access=\"{access}\"}} 0\n")));
+        }
+        service.close().await;
     }
 
     #[cfg(feature = "metrics")]

@@ -14,7 +14,7 @@ routing within one database; it does not implement database sharding or fanout.
 Pin the release tag used by these examples in the consuming application:
 
 ```toml
-mysql = { package = "brz-mysql", version = "0.0.18" }
+mysql = { package = "brz-mysql", version = "0.0.19" }
 ```
 
 Repository routing handles replace the earlier global sharding options.
@@ -88,7 +88,8 @@ queries pay the cost of preparing the statement again.
 Enable `metrics` to eagerly register `MYSQL` handles with business `name`,
 `endpoint="host:port"` and `access="read"`, `"write"`, or `"other"` (whole transactions).
 The default name is the endpoint. `MysqlService::connect_named` and
-`connect_lazy_named` supply an explicit business name. Reads use the configured
+`connect_lazy_named` supply an explicit business name.
+`connect_lazy_read_write_named_with_options` names both master/slave pools. Reads use the configured
 slave endpoint if present; writes and transactions use the master. No MySQL
 connection metrics are collected. Cached handles perform no registration or
 label allocation during request recording.
