@@ -198,7 +198,7 @@ or `FOR UPDATE` in `fetch`, `fetch_one`, `fetch_optional`, and `fetch_all`,
 including routed service queries, before sending SQL to MySQL:
 
 ```toml
-brz-mysql = { version = "=0.0.20", features = ["read-query-check"] }
+brz-mysql = { version = "=0.0.21", features = ["read-query-check"] }
 ```
 
 Matches return `MysqlError::InvalidQuery`. This is a literal substring check,
