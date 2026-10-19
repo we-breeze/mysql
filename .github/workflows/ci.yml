@@ -23,6 +23,7 @@ jobs:
       - run: cargo clippy --workspace --locked --all-targets --all-features -- -D warnings
       - run: cargo clippy --workspace --locked --all-targets --no-default-features -- -D warnings
       - run: cargo test --workspace --locked
+      - run: cargo test --workspace --locked --features read-query-check,metrics,slow-log
       - run: cargo test --workspace --locked --no-default-features
       - run: cargo test --workspace --locked --release
       - name: Test against MySQL 5.7
