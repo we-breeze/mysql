@@ -248,7 +248,8 @@ impl MysqlService {
     {
         let observation = Observation::query(Some(self.metrics.read), sql.as_ref());
         let result = run_with_timeout(self.query_timeout, async move {
-            let (sql, arguments) = prepare_query(sql.as_ref(), arguments, self.routing.as_ref())?;
+            let (sql, arguments) =
+                prepare_fetch_query(sql.as_ref(), arguments, self.routing.as_ref())?;
             sqlx::query_with::<MySql, _>(sql.as_ref(), arguments)
                 .fetch_optional(self.read_pool())
                 .await
@@ -269,7 +270,8 @@ impl MysqlService {
     {
         let observation = Observation::query(Some(self.metrics.read), sql.as_ref());
         let result = run_with_timeout(self.query_timeout, async move {
-            let (sql, arguments) = prepare_query(sql.as_ref(), arguments, self.routing.as_ref())?;
+            let (sql, arguments) =
+                prepare_fetch_query(sql.as_ref(), arguments, self.routing.as_ref())?;
             sqlx::query_with::<MySql, _>(sql.as_ref(), arguments)
                 .fetch_optional(self.read_pool())
                 .await
@@ -298,7 +300,7 @@ impl MysqlService {
             let observation = Observation::query(Some(self.metrics.read), sql.as_ref());
             let deadline = tokio::time::Instant::now() + self.query_timeout;
             let mut success = true;
-            let (sql, arguments) = match prepare_query(
+            let (sql, arguments) = match prepare_fetch_query(
                 sql.as_ref(),
                 arguments,
                 self.routing.as_ref(),
@@ -678,6 +680,24 @@ impl MysqlTransaction for MysqlTransactionService {
     }
 }
 
+fn prepare_fetch_query<'sql, A>(
+    sql: &'sql str,
+    arguments: A,
+    route: Option<&QueryRouting>,
+) -> MysqlResult<(Cow<'sql, str>, sqlx::mysql::MySqlArguments)>
+where
+    A: MysqlArgs,
+{
+    let (sql, arguments) = prepare_query(sql, arguments, route)?;
+    #[cfg(feature = "read-query-check")]
+    if sql.contains("for update") || sql.contains("FOR UPDATE") {
+        return Err(crate::routing::invalid(
+            "FOR UPDATE is not allowed in fetch queries",
+        ));
+    }
+    Ok((sql, arguments))
+}
+
 pub(crate) fn prepare_query<'sql, A>(
     sql: &'sql str,
     arguments: A,
@@ -961,3 +981,6 @@ mod routing_tests;
 
 #[cfg(all(test, feature = "integration-tests"))]
 mod statement_cache_tests;
+
+#[cfg(test)]
+mod read_query_check_tests;

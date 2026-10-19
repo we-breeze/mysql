@@ -190,6 +190,22 @@ transactions. Existing named `MysqlRow::get`/`get_required` and custom
 `FromMysqlValue` implementations remain supported; `get_at` reads by zero-based
 position, including results with repeated column names.
 
+## Optional fetch query check
+
+The `read-query-check` Cargo feature is disabled by default. Enable it in the
+consumer's dependency to reject SQL containing the exact substring `for update`
+or `FOR UPDATE` in `fetch`, `fetch_one`, `fetch_optional`, and `fetch_all`,
+including routed service queries, before sending SQL to MySQL:
+
+```toml
+brz-mysql = { version = "=0.0.20", features = ["read-query-check"] }
+```
+
+Matches return `MysqlError::InvalidQuery`. This is a literal substring check,
+not SQL parsing: it also matches strings and comments, while mixed case and
+other whitespace are not matched. It does not enforce SELECT-only queries.
+Transaction fetch queries allow `FOR UPDATE`; `execute` is unaffected. Disabled builds do not scan SQL for these substrings.
+
 ## Transactions
 
 ```rust
