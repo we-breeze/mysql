@@ -228,7 +228,8 @@ impl MysqlService {
     {
         let observation = Observation::query(Some(self.metrics.write), sql.as_ref());
         let result = run_with_timeout(self.query_timeout, async move {
-            let (sql, arguments) = prepare_query(sql.as_ref(), arguments, self.routing.as_ref())?;
+            let (sql, arguments) =
+                prepare_execute_query(sql.as_ref(), arguments, self.routing.as_ref())?;
             sqlx::query_with::<MySql, _>(sql.as_ref(), arguments)
                 .execute(&self.master_pool)
                 .await
@@ -347,7 +348,7 @@ impl MysqlService {
         Ok(values)
     }
 
-    /// Runs one scoped transaction. The closure cannot commit or roll back.
+    /// Runs one scoped transaction, committing on Ok and rolling back on Err.
     pub async fn with_transaction<T, F>(&self, operation: F) -> MysqlResult<T>
     where
         T: Send,
@@ -555,6 +556,8 @@ impl MysqlTransaction for MysqlTransactionService {
     {
         let observation = Observation::query(None, sql.as_ref());
         let result = run_with_timeout(self.query_timeout, async {
+            #[cfg(feature = "ai-strict")]
+            check_execute_autocommit(sql.as_ref())?;
             let (sql, arguments) = prepare_query(sql.as_ref(), arguments, self.route.as_ref())?;
             sqlx::query_with::<MySql, _>(sql.as_ref(), arguments)
                 .execute(&mut **self.inner()?)
@@ -680,6 +683,57 @@ impl MysqlTransaction for MysqlTransactionService {
     }
 }
 
+#[cfg(feature = "ai-strict")]
+fn check_execute_autocommit(sql: &str) -> MysqlResult<()> {
+    let trimmed = sql.trim_start();
+    if trimmed
+        .get(..3)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("set"))
+        && trimmed.to_ascii_lowercase().contains("autocommit")
+    {
+        return Err(crate::routing::invalid(
+            "autocommit is managed by MysqlService and must not be set manually",
+        ));
+    }
+    Ok(())
+}
+
+fn prepare_execute_query<'sql, A>(
+    sql: &'sql str,
+    arguments: A,
+    route: Option<&QueryRouting>,
+) -> MysqlResult<(Cow<'sql, str>, sqlx::mysql::MySqlArguments)>
+where
+    A: MysqlArgs,
+{
+    #[cfg(feature = "ai-strict")]
+    {
+        check_execute_autocommit(sql)?;
+        let trimmed = sql.trim_start();
+        if trimmed
+            .get(..6)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("commit"))
+        {
+            return Err(crate::routing::invalid(
+                "MySQL uses autocommit by default; a separate COMMIT is not needed. Use with_transaction for explicit transactions",
+            ));
+        }
+        if !["insert", "update", "delete", "replace", "select"]
+            .iter()
+            .any(|keyword| {
+                trimmed
+                    .get(..keyword.len())
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case(keyword))
+            })
+        {
+            return Err(crate::routing::invalid(
+                "execute only accepts INSERT, UPDATE, DELETE, REPLACE, or SELECT; use with_transaction for other SQL",
+            ));
+        }
+    }
+    prepare_query(sql, arguments, route)
+}
+
 fn prepare_fetch_query<'sql, A>(
     sql: &'sql str,
     arguments: A,
@@ -689,7 +743,7 @@ where
     A: MysqlArgs,
 {
     let (sql, arguments) = prepare_query(sql, arguments, route)?;
-    #[cfg(feature = "read-query-check")]
+    #[cfg(feature = "ai-strict")]
     if sql.contains("for update") || sql.contains("FOR UPDATE") {
         return Err(crate::routing::invalid(
             "FOR UPDATE is not allowed in fetch queries",
@@ -984,3 +1038,6 @@ mod statement_cache_tests;
 
 #[cfg(test)]
 mod read_query_check_tests;
+
+#[cfg(test)]
+mod execute_query_check_tests;

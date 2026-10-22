@@ -190,21 +190,46 @@ transactions. Existing named `MysqlRow::get`/`get_required` and custom
 `FromMysqlValue` implementations remain supported; `get_at` reads by zero-based
 position, including results with repeated column names.
 
-## Optional fetch query check
+## Optional AI strict checks
 
-The `read-query-check` Cargo feature is disabled by default. Enable it in the
-consumer's dependency to reject SQL containing the exact substring `for update`
-or `FOR UPDATE` in `fetch`, `fetch_one`, `fetch_optional`, and `fetch_all`,
-including routed service queries, before sending SQL to MySQL:
+The `ai-strict` Cargo feature is disabled by default. Enable it to apply
+standard usage checks:
 
 ```toml
-brz-mysql = { version = "=0.0.21", features = ["read-query-check"] }
+brz-mysql = { version = "=0.0.22", features = ["ai-strict"] }
 ```
 
-Matches return `MysqlError::InvalidQuery`. This is a literal substring check,
-not SQL parsing: it also matches strings and comments, while mixed case and
-other whitespace are not matched. It does not enforce SELECT-only queries.
-Transaction fetch queries allow `FOR UPDATE`; `execute` is unaffected. Disabled builds do not scan SQL for these substrings.
+`execute` accepts SQL starting with `insert`, `update`, `delete`, `replace`, or
+`select`, ignoring leading whitespace and ASCII letter case. Other SQL returns
+`MysqlError::InvalidQuery` before connecting, with a message directing the caller
+to `with_transaction`. `execute` accepts `SELECT` but returns only execution
+metadata; use `fetch_*` to retrieve rows.
+
+Outside transactions, `execute("COMMIT", ())` returns a dedicated error explaining
+that MySQL uses autocommit by default and needs no separate `COMMIT`, and directs
+the caller to `with_transaction` for explicit transactions.
+
+Both ordinary and transaction `execute` calls reject SQL starting with `set`
+and containing `autocommit`, ignoring leading whitespace and ASCII letter case.
+Matches return `MysqlError::InvalidQuery`: the service owns the autocommit
+setting. This is a substring check, including matches inside strings and comments.
+
+`fetch`, `fetch_one`, `fetch_optional`, and `fetch_all` reject SQL containing the
+exact substring `for update` or `FOR UPDATE` with `MysqlError::InvalidQuery` before
+sending SQL to MySQL. This literal substring check also matches strings and
+comments, while mixed case and other whitespace are not matched. It does not
+enforce SELECT-only queries.
+
+Calls through `Mysql` and routed service handles use the same checks. Transaction
+`execute` calls, including routed transaction views, are not subject to the
+ordinary service prefix restriction: `COMMIT` and `ROLLBACK` remain allowed
+inside transactions. These commands end the current transaction immediately;
+later SQL in the closure is no longer protected by that transaction.
+Transaction fetch queries allow `FOR UPDATE`.
+
+This is a simple prefix check: it does not parse SQL, skip comments, or inspect
+later statements. A leading comment or `WITH` does not match an allowed prefix.
+Without `ai-strict`, none of these checks run.
 
 ## Transactions
 
@@ -231,9 +256,9 @@ let task: Task = mysql
 # Ok::<(), brz_mysql::MysqlError>(())
 ```
 
-The public Mysql contract does not expose begin, commit, or rollback. Returning
-Ok from the closure commits; returning Err rolls back. Cancellation or panic
-drops the private SQLx transaction, which schedules rollback.
+The public Mysql contract does not expose begin, commit, or rollback methods.
+Returning Ok from the closure commits; returning Err rolls back. Cancellation or
+panic drops the private SQLx transaction, which schedules rollback.
 
 ## Streaming
 

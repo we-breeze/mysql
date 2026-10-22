@@ -9,7 +9,7 @@ fn literal_check_is_optional_and_does_not_parse_sql() {
         "SELECT 1 /* FOR UPDATE */",
     ] {
         let result = prepare_fetch_query(sql, (), None);
-        if cfg!(feature = "read-query-check") {
+        if cfg!(feature = "ai-strict") {
             assert!(
                 matches!(result, Err(MysqlError::InvalidQuery { .. })),
                 "{sql}"
@@ -29,7 +29,7 @@ fn literal_check_is_optional_and_does_not_parse_sql() {
     }
 }
 
-#[cfg(feature = "read-query-check")]
+#[cfg(feature = "ai-strict")]
 #[tokio::test]
 async fn service_fetch_rejects_but_transactions_allow_locking_queries() {
     async fn check_transaction<T: MysqlTransaction>(tx: &mut T, sql: &str) {
