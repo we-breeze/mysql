@@ -1,7 +1,8 @@
 #![cfg(feature = "integration-tests")]
 
 use brz_mysql::{
-    FromMysqlRow, MysqlError, MysqlResult, MysqlService, MysqlServiceOptions, MysqlTransaction,
+    FromMysqlRow, MysqlError, MysqlNestedTransaction, MysqlResult, MysqlService,
+    MysqlServiceOptions, MysqlTransaction,
 };
 use std::time::Duration;
 
@@ -43,6 +44,15 @@ async fn connection<T: MysqlTransaction>(tx: &mut T) -> MysqlResult<u64> {
     Ok(row.value)
 }
 
+async fn generic_savepoint<T: MysqlNestedTransaction>(
+    tx: &mut T,
+    table: &str,
+    id: i64,
+) -> MysqlResult<()> {
+    tx.with_transaction(async |inner| insert(inner, table, id).await)
+        .await
+}
+
 #[tokio::test]
 async fn nested_success_stays_on_one_connection_and_outer_rollback_undoes_every_level() {
     let table = "brz_nested_outer_rollback";
@@ -59,7 +69,7 @@ async fn nested_success_stays_on_one_connection_and_outer_rollback_undoes_every_
                 inner
                     .with_transaction(async |deep| {
                         assert_eq!(connection(deep).await?, id);
-                        insert(deep, table, 3).await
+                        generic_savepoint(deep, table, 3).await
                     })
                     .await
             })

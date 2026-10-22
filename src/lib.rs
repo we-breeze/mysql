@@ -20,15 +20,15 @@ mod row;
 mod transaction;
 
 pub use api::{
-    Mysql, MysqlError, MysqlExecution, MysqlResult, MysqlServiceOptions, MysqlTransaction,
-    PoolStats,
+    Mysql, MysqlError, MysqlExecution, MysqlNestedTransaction, MysqlResult, MysqlServiceOptions,
+    MysqlTransaction, PoolStats,
 };
 pub use arguments::{Json, MysqlArgs, MysqlRouteValue, MysqlValue, MysqlValueWriter};
 pub use binary_column::BinaryColumn;
 pub use brz_mysql_derive::{FromMysqlCol, FromMysqlRow};
 pub use column::FromMysqlCol;
 pub use mysql_service::MysqlService;
-pub use routed_transaction::RoutedMysqlTransaction;
+pub use routed_transaction::{RoutedMysqlTransaction, RoutedMysqlTransactionScope};
 pub use routing::{MysqlRouteKey, MysqlRouteOutput, MysqlRouting};
 pub use row::{FromMysqlRow, FromMysqlValue, MysqlRow};
-pub use transaction::MysqlTransactionService;
+pub use transaction::{MysqlTransactionScope, MysqlTransactionService};

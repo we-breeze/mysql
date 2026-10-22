@@ -6,36 +6,54 @@ use crate::mysql_service::{
     decode_row, execution, map_sqlx_error, prepare_query, run_with_timeout,
 };
 use crate::query_routing::QueryRouting;
-use crate::{FromMysqlRow, MysqlArgs, MysqlError, MysqlExecution, MysqlResult, MysqlTransaction};
+use crate::{
+    FromMysqlRow, MysqlArgs, MysqlError, MysqlExecution, MysqlNestedTransaction, MysqlResult,
+    MysqlTransaction,
+};
 use async_stream::stream;
 use futures_core::Stream;
 use futures_util::{StreamExt, pin_mut};
 use sqlx::MySql;
 
 /// Scoped transaction value created only by MysqlService::with_transaction.
-pub struct MysqlTransactionService<'connection> {
+pub struct MysqlTransactionScope<'connection> {
     pub(crate) inner: Option<sqlx::Transaction<'connection, MySql>>,
     pub(crate) route: Option<QueryRouting>,
     pub(crate) query_timeout: std::time::Duration,
 }
 
-impl std::fmt::Debug for MysqlTransactionService<'_> {
+/// Owned outer transaction handle, preserving the original public type.
+pub type MysqlTransactionService = MysqlTransactionScope<'static>;
+
+impl std::fmt::Debug for MysqlTransactionScope<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("MysqlTransactionService")
+            .debug_struct("MysqlTransactionScope")
             .finish_non_exhaustive()
     }
 }
 
-impl<'connection> MysqlTransactionService<'connection> {
+impl<'connection> MysqlTransactionScope<'connection> {
     /// Bind a key for queries on this same transaction connection. The
     /// transaction's default routing key is unchanged after this view is dropped.
     pub fn route<K: crate::MysqlRouteKey>(
         &mut self,
         key: K,
-    ) -> crate::RoutedMysqlTransaction<'_, 'connection> {
+    ) -> crate::RoutedMysqlTransactionScope<'_, 'connection> {
         let routing = self.route.as_ref().map(|routing| routing.with_key(key));
-        crate::RoutedMysqlTransaction::new(self, routing)
+        crate::RoutedMysqlTransactionScope::new(self, routing)
+    }
+
+    pub async fn with_transaction<'nested, T, F>(&'nested mut self, operation: F) -> MysqlResult<T>
+    where
+        T: Send,
+        F: for<'operation> AsyncFnOnce(
+                &'operation mut MysqlTransactionScope<'nested>,
+            ) -> MysqlResult<T>
+            + Send,
+    {
+        let route = self.route.clone();
+        self.with_nested_route(route, operation).await
     }
 
     /// Run a SAVEPOINT on this same connection. Success releases only the
@@ -49,7 +67,7 @@ impl<'connection> MysqlTransactionService<'connection> {
     where
         T: Send,
         F: for<'operation> AsyncFnOnce(
-                &'operation mut MysqlTransactionService<'nested>,
+                &'operation mut MysqlTransactionScope<'nested>,
             ) -> MysqlResult<T>
             + Send,
     {
@@ -58,7 +76,7 @@ impl<'connection> MysqlTransactionService<'connection> {
             let inner = sqlx::Acquire::begin(self.inner()?)
                 .await
                 .map_err(map_sqlx_error)?;
-            let mut nested = MysqlTransactionService {
+            let mut nested = MysqlTransactionScope {
                 inner: Some(inner),
                 route,
                 query_timeout: timeout,
@@ -107,9 +125,9 @@ impl<'connection> MysqlTransactionService<'connection> {
     }
 }
 
-impl MysqlTransaction for MysqlTransactionService<'_> {
+impl MysqlNestedTransaction for MysqlTransactionScope<'_> {
     type Transaction<'nested>
-        = MysqlTransactionService<'nested>
+        = MysqlTransactionScope<'nested>
     where
         Self: 'nested;
 
@@ -125,7 +143,9 @@ impl MysqlTransaction for MysqlTransactionService<'_> {
         let route = self.route.clone();
         self.with_nested_route(route, operation).await
     }
+}
 
+impl MysqlTransaction for MysqlTransactionScope<'_> {
     async fn execute<S, A>(&mut self, sql: S, arguments: A) -> MysqlResult<MysqlExecution>
     where
         S: AsRef<str> + Send,

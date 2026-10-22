@@ -355,7 +355,7 @@ impl MysqlService {
     where
         T: Send,
         F: for<'transaction> AsyncFnOnce(
-                &'transaction mut MysqlTransactionService<'static>,
+                &'transaction mut MysqlTransactionService,
             ) -> MysqlResult<T>
             + Send,
     {
@@ -414,10 +414,7 @@ impl MysqlService {
         self.master_pool.close().await;
     }
 
-    async fn begin(
-        &self,
-        route: Option<QueryRouting>,
-    ) -> MysqlResult<MysqlTransactionService<'static>> {
+    async fn begin(&self, route: Option<QueryRouting>) -> MysqlResult<MysqlTransactionService> {
         self.master_pool
             .begin()
             .await
@@ -439,7 +436,7 @@ fn pool_stats(pool: &MySqlPool) -> crate::PoolStats {
 }
 
 impl Mysql for MysqlService {
-    type Transaction = MysqlTransactionService<'static>;
+    type Transaction = MysqlTransactionService;
 
     fn with_route<R: MysqlRouting + 'static>(&self, routing: R) -> MysqlService {
         MysqlService::with_route(self, routing)
