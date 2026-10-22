@@ -254,6 +254,25 @@ pub trait Mysql: Send + Sync {
 /// Scoped query operations available inside Mysql::with_transaction.
 #[allow(async_fn_in_trait)]
 pub trait MysqlTransaction: Send {
+    /// A borrowed SAVEPOINT scope on the same connection and routing context.
+    type Transaction<'transaction>: MysqlTransaction
+    where
+        Self: 'transaction;
+
+    /// Release a nested SAVEPOINT on Ok, or roll back to it on Err.
+    /// The outer transaction remains open and owns the final commit.
+    async fn with_transaction<'transaction, T, F>(
+        &'transaction mut self,
+        operation: F,
+    ) -> MysqlResult<T>
+    where
+        Self: 'transaction,
+        T: Send,
+        F: for<'operation> AsyncFnOnce(
+                &'operation mut Self::Transaction<'transaction>,
+            ) -> MysqlResult<T>
+            + Send;
+
     async fn execute<S, A>(&mut self, sql: S, arguments: A) -> MysqlResult<MysqlExecution>
     where
         S: AsRef<str> + Send,

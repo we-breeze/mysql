@@ -17,6 +17,7 @@ mod query_routing;
 mod routed_transaction;
 mod routing;
 mod row;
+mod transaction;
 
 pub use api::{
     Mysql, MysqlError, MysqlExecution, MysqlResult, MysqlServiceOptions, MysqlTransaction,
@@ -26,7 +27,8 @@ pub use arguments::{Json, MysqlArgs, MysqlRouteValue, MysqlValue, MysqlValueWrit
 pub use binary_column::BinaryColumn;
 pub use brz_mysql_derive::{FromMysqlCol, FromMysqlRow};
 pub use column::FromMysqlCol;
-pub use mysql_service::{MysqlService, MysqlTransactionService};
+pub use mysql_service::MysqlService;
 pub use routed_transaction::RoutedMysqlTransaction;
 pub use routing::{MysqlRouteKey, MysqlRouteOutput, MysqlRouting};
 pub use row::{FromMysqlRow, FromMysqlValue, MysqlRow};
+pub use transaction::MysqlTransactionService;

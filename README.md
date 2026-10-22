@@ -260,6 +260,35 @@ The public Mysql contract does not expose begin, commit, or rollback methods.
 Returning Ok from the closure commits; returning Err rolls back. Cancellation or
 panic drops the private SQLx transaction, which schedules rollback.
 
+Transactions also implement `MysqlTransaction::with_transaction`. Calling it on
+an existing transaction opens a SQLx SAVEPOINT on that same physical connection:
+
+```rust,ignore
+use brz_mysql::{MysqlResult, MysqlTransaction};
+
+mysql.with_transaction(async |outer| {
+    outer.execute("INSERT INTO items (id) VALUES (?)", (1_i64,)).await?;
+    let result = outer.with_transaction(async |inner| {
+        inner.execute("INSERT INTO items (id) VALUES (?)", (2_i64,)).await?;
+        MysqlResult::Ok(())
+    }).await;
+    // Handle a recoverable inner error here, or propagate it with `?`.
+    result?;
+    MysqlResult::Ok(())
+}).await?;
+```
+
+An inner success releases its SAVEPOINT without committing the outer transaction.
+An inner error rolls back to that SAVEPOINT; a caught error lets the outer scope
+continue, while a propagated error rolls back the enclosing scope. Arbitrary
+nesting, routed transaction views and inherited routing use the same socket.
+Cancelling an inner future drops its SQLx savepoint and schedules rollback before
+the connection is reused. Outer completion owns the final COMMIT or ROLLBACK.
+The public `MysqlTransactionService` now carries the connection lifetime;
+implementations of `MysqlTransaction` declare its borrowed `Transaction<'a>`
+associated type and the nested `with_transaction` operation.
+
+
 ## Streaming
 
 fetch is the primary large-result API. It is lazy and decodes one row at a

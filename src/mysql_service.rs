@@ -10,12 +10,14 @@ use sqlx::{
     mysql::{MySqlConnectOptions, MySqlPoolOptions},
 };
 
+#[cfg(test)]
+use crate::MysqlTransaction;
 use crate::metrics::{MysqlMetrics, Observation};
 
 use crate::{
     FromMysqlRow, Mysql, MysqlArgs, MysqlError, MysqlExecution, MysqlResult, MysqlRouteKey,
-    MysqlRouting, MysqlRow, MysqlServiceOptions, MysqlTransaction, arguments::encode_arguments,
-    query_routing::QueryRouting, routing::render_sql,
+    MysqlRouting, MysqlRow, MysqlServiceOptions, MysqlTransactionService,
+    arguments::encode_arguments, query_routing::QueryRouting, routing::render_sql,
 };
 
 /// SQLx-backed MySQL service with optional per-handle table routing.
@@ -353,7 +355,7 @@ impl MysqlService {
     where
         T: Send,
         F: for<'transaction> AsyncFnOnce(
-                &'transaction mut MysqlTransactionService,
+                &'transaction mut MysqlTransactionService<'static>,
             ) -> MysqlResult<T>
             + Send,
     {
@@ -412,7 +414,10 @@ impl MysqlService {
         self.master_pool.close().await;
     }
 
-    async fn begin(&self, route: Option<QueryRouting>) -> MysqlResult<MysqlTransactionService> {
+    async fn begin(
+        &self,
+        route: Option<QueryRouting>,
+    ) -> MysqlResult<MysqlTransactionService<'static>> {
         self.master_pool
             .begin()
             .await
@@ -434,7 +439,7 @@ fn pool_stats(pool: &MySqlPool) -> crate::PoolStats {
 }
 
 impl Mysql for MysqlService {
-    type Transaction = MysqlTransactionService;
+    type Transaction = MysqlTransactionService<'static>;
 
     fn with_route<R: MysqlRouting + 'static>(&self, routing: R) -> MysqlService {
         MysqlService::with_route(self, routing)
@@ -498,193 +503,8 @@ impl Mysql for MysqlService {
     }
 }
 
-/// Scoped transaction value created only by MysqlService::with_transaction.
-pub struct MysqlTransactionService {
-    inner: Option<sqlx::Transaction<'static, MySql>>,
-    route: Option<QueryRouting>,
-    query_timeout: std::time::Duration,
-}
-
-impl std::fmt::Debug for MysqlTransactionService {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("MysqlTransactionService")
-            .finish_non_exhaustive()
-    }
-}
-
-impl MysqlTransactionService {
-    /// Bind a key for queries on this same transaction connection. The
-    /// transaction's default routing key is unchanged after this view is dropped.
-    pub fn route<K: crate::MysqlRouteKey>(&mut self, key: K) -> crate::RoutedMysqlTransaction<'_> {
-        let routing = self.route.as_ref().map(|routing| routing.with_key(key));
-        crate::RoutedMysqlTransaction::new(self, routing)
-    }
-
-    fn inner(&mut self) -> MysqlResult<&mut sqlx::Transaction<'static, MySql>> {
-        self.inner.as_mut().ok_or_else(|| MysqlError::Database {
-            code: None,
-            sql_state: None,
-            message: "transaction is already complete".to_string(),
-        })
-    }
-
-    async fn commit(mut self) -> MysqlResult<()> {
-        self.inner
-            .take()
-            .expect("transaction is present until it is consumed")
-            .commit()
-            .await
-            .map_err(map_sqlx_error)
-    }
-
-    async fn rollback(mut self) -> MysqlResult<()> {
-        self.inner
-            .take()
-            .expect("transaction is present until it is consumed")
-            .rollback()
-            .await
-            .map_err(map_sqlx_error)
-    }
-}
-
-impl MysqlTransaction for MysqlTransactionService {
-    async fn execute<S, A>(&mut self, sql: S, arguments: A) -> MysqlResult<MysqlExecution>
-    where
-        S: AsRef<str> + Send,
-        A: MysqlArgs + Send,
-    {
-        let observation = Observation::query(None, sql.as_ref());
-        let result = run_with_timeout(self.query_timeout, async {
-            #[cfg(feature = "ai-strict")]
-            check_execute_autocommit(sql.as_ref())?;
-            let (sql, arguments) = prepare_query(sql.as_ref(), arguments, self.route.as_ref())?;
-            sqlx::query_with::<MySql, _>(sql.as_ref(), arguments)
-                .execute(&mut **self.inner()?)
-                .await
-                .map(execution)
-                .map_err(map_sqlx_error)
-        })
-        .await;
-        observation.finish(result.is_ok());
-        result
-    }
-
-    async fn fetch_optional<S, A, T>(&mut self, sql: S, arguments: A) -> MysqlResult<Option<T>>
-    where
-        S: AsRef<str> + Send,
-        A: MysqlArgs + Send,
-        T: FromMysqlRow + Send,
-    {
-        let observation = Observation::query(None, sql.as_ref());
-        let result = run_with_timeout(self.query_timeout, async {
-            let (sql, arguments) = prepare_query(sql.as_ref(), arguments, self.route.as_ref())?;
-            sqlx::query_with::<MySql, _>(sql.as_ref(), arguments)
-                .fetch_optional(&mut **self.inner()?)
-                .await
-                .map_err(map_sqlx_error)?
-                .map(decode_row)
-                .transpose()
-        })
-        .await;
-        observation.finish(result.is_ok());
-        result
-    }
-
-    async fn fetch_one<S, A, T>(&mut self, sql: S, arguments: A) -> MysqlResult<T>
-    where
-        S: AsRef<str> + Send,
-        A: MysqlArgs + Send,
-        T: FromMysqlRow + Send,
-    {
-        let observation = Observation::query(None, sql.as_ref());
-        let result = run_with_timeout(self.query_timeout, async {
-            let (sql, arguments) = prepare_query(sql.as_ref(), arguments, self.route.as_ref())?;
-            sqlx::query_with::<MySql, _>(sql.as_ref(), arguments)
-                .fetch_optional(&mut **self.inner()?)
-                .await
-                .map_err(map_sqlx_error)?
-                .map(decode_row)
-                .transpose()?
-                .ok_or(MysqlError::RowNotFound)
-        })
-        .await;
-        observation.finish(result.is_ok());
-        result
-    }
-
-    fn fetch<'transaction, S, A, T>(
-        &'transaction mut self,
-        sql: S,
-        arguments: A,
-    ) -> impl Stream<Item = MysqlResult<T>> + Send + 'transaction
-    where
-        S: AsRef<str> + Send + 'transaction,
-        A: MysqlArgs + Send + 'transaction,
-        T: FromMysqlRow + Send + 'transaction,
-    {
-        stream! {
-            let observation = Observation::query(None, sql.as_ref());
-            let deadline = tokio::time::Instant::now() + self.query_timeout;
-            let mut success = true;
-            let (sql, arguments) = match prepare_query(
-                sql.as_ref(),
-                arguments,
-                self.route.as_ref(),
-            ) {
-                Ok(prepared) => prepared,
-                Err(error) => {
-                    yield Err(error);
-                    return;
-                }
-            };
-            let transaction = match self.inner() {
-                Ok(transaction) => transaction,
-                Err(error) => {
-                    yield Err(error);
-                    return;
-                }
-            };
-            let rows =
-                sqlx::query_with::<MySql, _>(sql.as_ref(), arguments).fetch(&mut **transaction);
-            pin_mut!(rows);
-            loop {
-                match tokio::time::timeout_at(deadline, rows.next()).await {
-                    Ok(Some(row)) => {
-                        let result = row.map_err(map_sqlx_error).and_then(decode_row);
-                        success &= result.is_ok();
-                        yield result;
-                    }
-                    Ok(None) => break,
-                    Err(_) => {
-                        observation.finish(false);
-                        yield Err(MysqlError::QueryTimedOut);
-                        return;
-                    }
-                }
-            }
-            observation.finish(success);
-        }
-    }
-
-    async fn fetch_all<S, A, T>(&mut self, sql: S, arguments: A) -> MysqlResult<Vec<T>>
-    where
-        S: AsRef<str> + Send,
-        A: MysqlArgs + Send,
-        T: FromMysqlRow + Send,
-    {
-        let rows = self.fetch(sql, arguments);
-        pin_mut!(rows);
-        let mut values = Vec::new();
-        while let Some(row) = rows.next().await {
-            values.push(row?);
-        }
-        Ok(values)
-    }
-}
-
 #[cfg(feature = "ai-strict")]
-fn check_execute_autocommit(sql: &str) -> MysqlResult<()> {
+pub(crate) fn check_execute_autocommit(sql: &str) -> MysqlResult<()> {
     let trimmed = sql.trim_start();
     if trimmed
         .get(..3)
@@ -765,7 +585,7 @@ where
     Ok((rendered, encoded))
 }
 
-async fn run_with_timeout<T>(
+pub(crate) async fn run_with_timeout<T>(
     timeout: std::time::Duration,
     future: impl Future<Output = MysqlResult<T>>,
 ) -> MysqlResult<T> {
@@ -875,18 +695,18 @@ fn mysql_metrics(
     }
 }
 
-fn execution(result: sqlx::mysql::MySqlQueryResult) -> MysqlExecution {
+pub(crate) fn execution(result: sqlx::mysql::MySqlQueryResult) -> MysqlExecution {
     MysqlExecution {
         rows_affected: result.rows_affected(),
         last_insert_id: result.last_insert_id(),
     }
 }
 
-fn decode_row<T: FromMysqlRow>(row: sqlx::mysql::MySqlRow) -> MysqlResult<T> {
+pub(crate) fn decode_row<T: FromMysqlRow>(row: sqlx::mysql::MySqlRow) -> MysqlResult<T> {
     T::from_mysql_row(MysqlRow::new(row))
 }
 
-fn map_sqlx_error(error: sqlx::Error) -> MysqlError {
+pub(crate) fn map_sqlx_error(error: sqlx::Error) -> MysqlError {
     match error {
         sqlx::Error::PoolTimedOut => MysqlError::PoolTimedOut,
         sqlx::Error::RowNotFound => MysqlError::RowNotFound,
