@@ -1,4 +1,5 @@
 //! Connection-bound transactions and nested SQLx SAVEPOINT scopes.
+mod savepoint;
 use crate::metrics::Observation;
 #[cfg(feature = "ai-strict")]
 use crate::mysql_service::check_execute_autocommit;
@@ -16,40 +17,35 @@ use futures_util::{StreamExt, pin_mut};
 use sqlx::MySql;
 
 /// Scoped transaction value created only by MysqlService::with_transaction.
-pub struct MysqlTransactionScope<'connection> {
-    pub(crate) inner: Option<sqlx::Transaction<'connection, MySql>>,
+pub struct MysqlTransactionService {
+    pub(crate) inner: Option<sqlx::Transaction<'static, MySql>>,
     pub(crate) route: Option<QueryRouting>,
     pub(crate) query_timeout: std::time::Duration,
 }
 
-/// Owned outer transaction handle, preserving the original public type.
-pub type MysqlTransactionService = MysqlTransactionScope<'static>;
+/// Explicit name for a scoped callback handle on the same owned connection.
+pub type MysqlTransactionScope<'connection> = MysqlTransactionService;
 
-impl std::fmt::Debug for MysqlTransactionScope<'_> {
+impl std::fmt::Debug for MysqlTransactionService {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("MysqlTransactionScope")
+            .debug_struct("MysqlTransactionService")
             .finish_non_exhaustive()
     }
 }
 
-impl<'connection> MysqlTransactionScope<'connection> {
+impl MysqlTransactionService {
     /// Bind a key for queries on this same transaction connection. The
     /// transaction's default routing key is unchanged after this view is dropped.
-    pub fn route<K: crate::MysqlRouteKey>(
-        &mut self,
-        key: K,
-    ) -> crate::RoutedMysqlTransactionScope<'_, 'connection> {
+    pub fn route<K: crate::MysqlRouteKey>(&mut self, key: K) -> crate::RoutedMysqlTransaction<'_> {
         let routing = self.route.as_ref().map(|routing| routing.with_key(key));
-        crate::RoutedMysqlTransactionScope::new(self, routing)
+        crate::RoutedMysqlTransaction::new(self, routing)
     }
 
-    pub async fn with_transaction<'nested, T, F>(&'nested mut self, operation: F) -> MysqlResult<T>
+    pub async fn with_transaction<T, F>(&mut self, operation: F) -> MysqlResult<T>
     where
         T: Send,
-        F: for<'operation> AsyncFnOnce(
-                &'operation mut MysqlTransactionScope<'nested>,
-            ) -> MysqlResult<T>
+        F: for<'operation> AsyncFnOnce(&'operation mut MysqlTransactionService) -> MysqlResult<T>
             + Send,
     {
         let route = self.route.clone();
@@ -59,34 +55,26 @@ impl<'connection> MysqlTransactionScope<'connection> {
     /// Run a SAVEPOINT on this same connection. Success releases only the
     /// savepoint; failure rolls back only its changes. SQLx also rolls back
     /// the savepoint if this future is cancelled before completion.
-    pub(crate) async fn with_nested_route<'nested, T, F>(
-        &'nested mut self,
+    pub(crate) async fn with_nested_route<T, F>(
+        &mut self,
         route: Option<QueryRouting>,
         operation: F,
     ) -> MysqlResult<T>
     where
         T: Send,
-        F: for<'operation> AsyncFnOnce(
-                &'operation mut MysqlTransactionScope<'nested>,
-            ) -> MysqlResult<T>
+        F: for<'operation> AsyncFnOnce(&'operation mut MysqlTransactionService) -> MysqlResult<T>
             + Send,
     {
         let timeout = self.query_timeout;
         run_with_timeout(timeout, async move {
-            let inner = sqlx::Acquire::begin(self.inner()?)
-                .await
-                .map_err(map_sqlx_error)?;
-            let mut nested = MysqlTransactionScope {
-                inner: Some(inner),
-                route,
-                query_timeout: timeout,
-            };
-            match operation(&mut nested).await {
+            let mut scope = savepoint::Savepoint::new(self, route)?;
+            scope.begin().await?;
+            match operation(scope.transaction()).await {
                 Ok(value) => {
-                    nested.commit().await?;
+                    scope.commit().await?;
                     Ok(value)
                 }
-                Err(operation) => match nested.rollback().await {
+                Err(operation) => match scope.rollback().await {
                     Ok(()) => Err(operation),
                     Err(rollback) => Err(MysqlError::TransactionRollback {
                         operation: Box::new(operation),
@@ -98,7 +86,7 @@ impl<'connection> MysqlTransactionScope<'connection> {
         .await
     }
 
-    fn inner(&mut self) -> MysqlResult<&mut sqlx::Transaction<'connection, MySql>> {
+    fn inner(&mut self) -> MysqlResult<&mut sqlx::Transaction<'static, MySql>> {
         self.inner.as_mut().ok_or_else(|| MysqlError::Database {
             code: None,
             sql_state: None,
@@ -125,7 +113,7 @@ impl<'connection> MysqlTransactionScope<'connection> {
     }
 }
 
-impl MysqlNestedTransaction for MysqlTransactionScope<'_> {
+impl MysqlNestedTransaction for MysqlTransactionService {
     type Transaction<'nested>
         = MysqlTransactionScope<'nested>
     where
@@ -145,7 +133,7 @@ impl MysqlNestedTransaction for MysqlTransactionScope<'_> {
     }
 }
 
-impl MysqlTransaction for MysqlTransactionScope<'_> {
+impl MysqlTransaction for MysqlTransactionService {
     async fn execute<S, A>(&mut self, sql: S, arguments: A) -> MysqlResult<MysqlExecution>
     where
         S: AsRef<str> + Send,

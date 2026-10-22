@@ -6,25 +6,24 @@ use futures_util::{StreamExt, pin_mut};
 
 use crate::{
     FromMysqlRow, MysqlArgs, MysqlExecution, MysqlNestedTransaction, MysqlResult, MysqlTransaction,
-    MysqlTransactionScope, mysql_service::render_query, query_routing::QueryRouting,
+    MysqlTransactionService, mysql_service::render_query, query_routing::QueryRouting,
 };
 
 /// A borrowed query view; it never starts, commits, or moves the transaction.
-pub struct RoutedMysqlTransactionScope<'transaction, 'connection> {
-    transaction: &'transaction mut MysqlTransactionScope<'connection>,
+pub struct RoutedMysqlTransaction<'transaction> {
+    transaction: &'transaction mut MysqlTransactionService,
     routing: Option<QueryRouting>,
 }
 
-/// Routed view of an owned outer transaction, preserving its original name.
-pub type RoutedMysqlTransaction<'transaction> = RoutedMysqlTransactionScope<'transaction, 'static>;
+/// Explicit name for a routed view inside any transaction scope.
+pub type RoutedMysqlTransactionScope<'transaction, 'connection> =
+    RoutedMysqlTransaction<'transaction>;
 
-impl<'transaction, 'connection> RoutedMysqlTransactionScope<'transaction, 'connection> {
-    pub async fn with_transaction<'nested, T, F>(&'nested mut self, operation: F) -> MysqlResult<T>
+impl<'transaction> RoutedMysqlTransaction<'transaction> {
+    pub async fn with_transaction<T, F>(&mut self, operation: F) -> MysqlResult<T>
     where
         T: Send,
-        F: for<'operation> AsyncFnOnce(
-                &'operation mut MysqlTransactionScope<'nested>,
-            ) -> MysqlResult<T>
+        F: for<'operation> AsyncFnOnce(&'operation mut MysqlTransactionService) -> MysqlResult<T>
             + Send,
     {
         self.transaction
@@ -33,7 +32,7 @@ impl<'transaction, 'connection> RoutedMysqlTransactionScope<'transaction, 'conne
     }
 
     pub(crate) fn new(
-        transaction: &'transaction mut MysqlTransactionScope<'connection>,
+        transaction: &'transaction mut MysqlTransactionService,
         routing: Option<QueryRouting>,
     ) -> Self {
         Self {
@@ -43,9 +42,9 @@ impl<'transaction, 'connection> RoutedMysqlTransactionScope<'transaction, 'conne
     }
 }
 
-impl MysqlNestedTransaction for RoutedMysqlTransactionScope<'_, '_> {
+impl MysqlNestedTransaction for RoutedMysqlTransaction<'_> {
     type Transaction<'nested>
-        = MysqlTransactionScope<'nested>
+        = MysqlTransactionService
     where
         Self: 'nested;
 
@@ -64,7 +63,7 @@ impl MysqlNestedTransaction for RoutedMysqlTransactionScope<'_, '_> {
     }
 }
 
-impl MysqlTransaction for RoutedMysqlTransactionScope<'_, '_> {
+impl MysqlTransaction for RoutedMysqlTransaction<'_> {
     async fn execute<S, A>(&mut self, sql: S, arguments: A) -> MysqlResult<MysqlExecution>
     where
         S: AsRef<str> + Send,

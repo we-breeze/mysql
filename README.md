@@ -282,12 +282,14 @@ An inner success releases its SAVEPOINT without committing the outer transaction
 An inner error rolls back to that SAVEPOINT; a caught error lets the outer scope
 continue, while a propagated error rolls back the enclosing scope. Arbitrary
 nesting, routed transaction views and inherited routing use the same socket.
-Cancelling an inner future drops its SQLx savepoint and schedules rollback before
-the connection is reused. Outer completion owns the final COMMIT or ROLLBACK.
+Cancelling an inner future queues SQLx rollback before the connection is reused.
+Outer completion owns the final COMMIT or ROLLBACK.
 `MysqlTransactionService` and `RoutedMysqlTransaction` retain their original
 public type signatures, and existing custom `MysqlTransaction` implementations
-need no changes. Borrowed inner handles use `MysqlTransactionScope<'a>` and
-`RoutedMysqlTransactionScope`. Generic code requiring nesting can add a
+need no changes. Every level receives the same concrete transaction handle;
+a private guard lends and restores its owned connection, including on cancellation.
+The `MysqlTransactionScope<'a>` and `RoutedMysqlTransactionScope` names remain
+available as aliases. Generic code requiring nesting can add a
 `MysqlNestedTransaction` bound; concrete handles expose an inherent
 `with_transaction` method.
 
