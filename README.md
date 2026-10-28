@@ -258,7 +258,33 @@ let task: Task = mysql
 
 The public Mysql contract does not expose begin, commit, or rollback methods.
 Returning Ok from the closure commits; returning Err rolls back. Cancellation or
-panic drops the private SQLx transaction, which schedules rollback.
+panic schedules rollback on the service-owned connection.
+
+Starting with `0.0.27`, use typed options when one root transaction needs a
+different isolation level:
+
+```rust,ignore
+use brz_mysql::{MysqlIsolationLevel, MysqlTransactionOptions};
+
+let options = MysqlTransactionOptions::default()
+    .with_isolation_level(MysqlIsolationLevel::ReadCommitted);
+mysql.with_transaction_options(options, async |tx| {
+    // Every query in this scope uses READ COMMITTED on the same connection.
+    tx.fetch_one("SELECT value FROM counters WHERE id = ?", (id,)).await
+}).await?;
+```
+
+The service sets the next transaction's isolation before `BEGIN` on its checked-out
+connection. Session defaults stay unchanged, and normal commit/rollback returns
+the clean connection for reuse. Cancelling or failing before `BEGIN` confirms
+discards the connection so a pending setting cannot reach another borrower.
+Cancelling an active scope queues rollback before reuse. Default options preserve
+`with_transaction` behavior; nested savepoints inherit the root's isolation.
+The same method is available through `Mysql`; custom implementations which do not
+support options reject non-default values before invoking the callback.
+Do not emulate this with `SET SESSION` inside a transaction or a separate pooled
+query: the former affects later transactions, and the latter may use another connection.
+See the [MySQL transaction scope rules](https://dev.mysql.com/doc/refman/8.4/en/set-transaction.html).
 
 Transactions also implement `MysqlNestedTransaction::with_transaction`. Calling it on
 an existing transaction opens a SQLx SAVEPOINT on that same physical connection:

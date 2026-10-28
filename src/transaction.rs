@@ -1,4 +1,6 @@
 //! Connection-bound transactions and nested SQLx SAVEPOINT scopes.
+pub(crate) mod inner;
+pub(crate) mod owned;
 mod savepoint;
 use crate::metrics::Observation;
 #[cfg(feature = "ai-strict")]
@@ -18,7 +20,7 @@ use sqlx::MySql;
 
 /// Scoped transaction value created only by MysqlService::with_transaction.
 pub struct MysqlTransactionService {
-    pub(crate) inner: Option<sqlx::Transaction<'static, MySql>>,
+    pub(crate) inner: Option<inner::InnerTransaction>,
     pub(crate) route: Option<QueryRouting>,
     pub(crate) query_timeout: std::time::Duration,
 }
@@ -86,7 +88,7 @@ impl MysqlTransactionService {
         .await
     }
 
-    fn inner(&mut self) -> MysqlResult<&mut sqlx::Transaction<'static, MySql>> {
+    fn inner(&mut self) -> MysqlResult<&mut inner::InnerTransaction> {
         self.inner.as_mut().ok_or_else(|| MysqlError::Database {
             code: None,
             sql_state: None,
@@ -100,7 +102,6 @@ impl MysqlTransactionService {
             .expect("transaction is present until it is consumed")
             .commit()
             .await
-            .map_err(map_sqlx_error)
     }
 
     pub(crate) async fn rollback(mut self) -> MysqlResult<()> {
@@ -109,7 +110,6 @@ impl MysqlTransactionService {
             .expect("transaction is present until it is consumed")
             .rollback()
             .await
-            .map_err(map_sqlx_error)
     }
 }
 

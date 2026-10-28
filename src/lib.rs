@@ -18,6 +18,7 @@ mod routed_transaction;
 mod routing;
 mod row;
 mod transaction;
+mod transaction_options;
 
 pub use api::{
     Mysql, MysqlError, MysqlExecution, MysqlNestedTransaction, MysqlResult, MysqlServiceOptions,
@@ -32,3 +33,4 @@ pub use routed_transaction::{RoutedMysqlTransaction, RoutedMysqlTransactionScope
 pub use routing::{MysqlRouteKey, MysqlRouteOutput, MysqlRouting};
 pub use row::{FromMysqlRow, FromMysqlValue, MysqlRow};
 pub use transaction::{MysqlTransactionScope, MysqlTransactionService};
+pub use transaction_options::{MysqlIsolationLevel, MysqlTransactionOptions};

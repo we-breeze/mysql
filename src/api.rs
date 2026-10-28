@@ -6,7 +6,9 @@ use std::time::Duration;
 use futures_core::Stream;
 use thiserror::Error;
 
-use crate::{FromMysqlRow, MysqlArgs, MysqlRouteKey, MysqlRouting, MysqlService};
+use crate::{
+    FromMysqlRow, MysqlArgs, MysqlRouteKey, MysqlRouting, MysqlService, MysqlTransactionOptions,
+};
 
 /// Result metadata for a write statement.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -251,6 +253,26 @@ pub trait Mysql: Send + Sync {
         T: Send,
         F: for<'transaction> AsyncFnOnce(&'transaction mut Self::Transaction) -> MysqlResult<T>
             + Send;
+
+    /// Apply typed characteristics to this root transaction only. Implementations
+    /// which do not provide options reject non-default values before the callback.
+    async fn with_transaction_options<T, F>(
+        &self,
+        options: MysqlTransactionOptions,
+        operation: F,
+    ) -> MysqlResult<T>
+    where
+        T: Send,
+        F: for<'transaction> AsyncFnOnce(&'transaction mut Self::Transaction) -> MysqlResult<T>
+            + Send,
+    {
+        if options != MysqlTransactionOptions::default() {
+            return Err(MysqlError::InvalidConfig {
+                reason: "this MySQL implementation does not support transaction options".into(),
+            });
+        }
+        self.with_transaction(operation).await
+    }
 }
 
 /// Scoped query operations available inside Mysql::with_transaction.
