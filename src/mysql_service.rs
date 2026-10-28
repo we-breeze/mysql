@@ -6,7 +6,7 @@ use async_stream::stream;
 use futures_core::Stream;
 use futures_util::{StreamExt, pin_mut};
 use sqlx::{
-    MySql, MySqlPool,
+    Arguments as _, MySql, MySqlPool,
     mysql::{MySqlConnectOptions, MySqlPoolOptions},
 };
 
@@ -232,11 +232,7 @@ impl MysqlService {
         let result = run_with_timeout(self.query_timeout, async move {
             let (sql, arguments) =
                 prepare_execute_query(sql.as_ref(), arguments, self.routing.as_ref())?;
-            sqlx::query_with::<MySql, _>(sql.as_ref(), arguments)
-                .execute(&self.master_pool)
-                .await
-                .map(execution)
-                .map_err(map_sqlx_error)
+            execute_query(&self.master_pool, sql.as_ref(), arguments).await
         })
         .await;
         observation.finish(result.is_ok());
@@ -692,6 +688,26 @@ fn mysql_metrics(
     }
 }
 
+/// Parameterless execution uses COM_QUERY: MySQL cannot prepare commands such
+/// as SAVEPOINT. Bound values retain SQLx's prepared-statement encoding.
+pub(crate) async fn execute_query<'executor, E>(
+    executor: E,
+    sql: &'executor str,
+    arguments: sqlx::mysql::MySqlArguments,
+) -> MysqlResult<MysqlExecution>
+where
+    E: sqlx::Executor<'executor, Database = MySql>,
+{
+    let result = if arguments.len() == 0 {
+        executor.execute(sql).await
+    } else {
+        sqlx::query_with::<MySql, _>(sql, arguments)
+            .execute(executor)
+            .await
+    };
+    result.map(execution).map_err(map_sqlx_error)
+}
+
 pub(crate) fn execution(result: sqlx::mysql::MySqlQueryResult) -> MysqlExecution {
     MysqlExecution {
         rows_affected: result.rows_affected(),
@@ -852,6 +868,9 @@ mod routing_tests;
 
 #[cfg(all(test, feature = "integration-tests"))]
 mod statement_cache_tests;
+
+#[cfg(all(test, feature = "integration-tests"))]
+mod execute_protocol_tests;
 
 #[cfg(test)]
 mod read_query_check_tests;

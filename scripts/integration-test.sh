@@ -49,3 +49,6 @@ BREEZE_MYSQL_TEST_URL="mysql://root:root@127.0.0.1:$PORT/brz_mysql_test?ssl-mode
 
 BREEZE_MYSQL_TEST_URL="mysql://root:root@127.0.0.1:$PORT/brz_mysql_test?ssl-mode=disabled" \
   cargo test --features integration-tests,ai-strict,metrics,slow-log --test nested_transactions
+
+BREEZE_MYSQL_TEST_URL="mysql://root:root@127.0.0.1:$PORT/brz_mysql_test?ssl-mode=disabled" \
+  cargo test --features integration-tests,ai-strict,metrics,slow-log --lib execute_protocol_tests

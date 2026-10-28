@@ -21,7 +21,7 @@ async fn assert_statements_closed(pool: &MySqlPool) {
     let rows = sqlx::Executor::fetch_all(
         &mut *connection,
         "SHOW SESSION STATUS WHERE Variable_name IN \
-         ('Com_stmt_prepare', 'Com_stmt_execute', 'Com_stmt_close')",
+         ('Com_stmt_prepare', 'Com_stmt_reprepare', 'Com_stmt_execute', 'Com_stmt_close')",
     )
     .await
     .unwrap();
@@ -33,9 +33,28 @@ async fn assert_statements_closed(pool: &MySqlPool) {
             (name, value.parse().unwrap())
         })
         .collect();
-    assert!(counters["Com_stmt_prepare"] > 0);
-    assert_eq!(counters["Com_stmt_prepare"], counters["Com_stmt_execute"]);
-    assert_eq!(counters["Com_stmt_prepare"], counters["Com_stmt_close"]);
+    // MySQL 8 can reprepare when bound parameter types become known. These
+    // server-side reprepares increment Com_stmt_prepare without creating a
+    // new client statement that needs a separate execute or close.
+    let prepared = counters["Com_stmt_prepare"]
+        .checked_sub(counters["Com_stmt_reprepare"])
+        .expect("reprepare count cannot exceed total prepares");
+    assert!(prepared > 0);
+    assert_eq!(prepared, counters["Com_stmt_execute"], "{counters:?}");
+    assert_eq!(prepared, counters["Com_stmt_close"], "{counters:?}");
+    let active = sqlx::Executor::fetch_one(
+        &mut *connection,
+        "SELECT COUNT(*) FROM performance_schema.prepared_statements_instances p \
+         JOIN performance_schema.threads t ON t.THREAD_ID = p.OWNER_THREAD_ID \
+         WHERE t.PROCESSLIST_ID = CONNECTION_ID()",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        active.get::<i64, _>(0),
+        0,
+        "every server statement must be closed"
+    );
 }
 
 async fn exercise_queries(mysql: &MysqlService) {

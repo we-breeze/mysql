@@ -193,6 +193,8 @@ pub trait Mysql: Send + Sync {
     /// this is a no-op, as on `MysqlService`.
     fn route<K: MysqlRouteKey>(&self, key: K) -> Self;
 
+    /// Execute SQL using the text protocol when there are no bound arguments;
+    /// statements with arguments use the prepared-statement protocol.
     fn execute<S, A>(
         &self,
         sql: S,
@@ -254,6 +256,7 @@ pub trait Mysql: Send + Sync {
 /// Scoped query operations available inside Mysql::with_transaction.
 #[allow(async_fn_in_trait)]
 pub trait MysqlTransaction: Send {
+    /// Uses the same protocol selection as [`Mysql::execute`] on this connection.
     async fn execute<S, A>(&mut self, sql: S, arguments: A) -> MysqlResult<MysqlExecution>
     where
         S: AsRef<str> + Send,

@@ -4,7 +4,7 @@ use crate::metrics::Observation;
 #[cfg(feature = "ai-strict")]
 use crate::mysql_service::check_execute_autocommit;
 use crate::mysql_service::{
-    decode_row, execution, map_sqlx_error, prepare_query, run_with_timeout,
+    decode_row, execute_query, map_sqlx_error, prepare_query, run_with_timeout,
 };
 use crate::query_routing::QueryRouting;
 use crate::{
@@ -144,11 +144,7 @@ impl MysqlTransaction for MysqlTransactionService {
             #[cfg(feature = "ai-strict")]
             check_execute_autocommit(sql.as_ref())?;
             let (sql, arguments) = prepare_query(sql.as_ref(), arguments, self.route.as_ref())?;
-            sqlx::query_with::<MySql, _>(sql.as_ref(), arguments)
-                .execute(&mut **self.inner()?)
-                .await
-                .map(execution)
-                .map_err(map_sqlx_error)
+            execute_query(&mut **self.inner()?, sql.as_ref(), arguments).await
         })
         .await;
         observation.finish(result.is_ok());

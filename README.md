@@ -294,6 +294,16 @@ available as aliases. Generic code requiring nesting can add a
 `with_transaction` method.
 
 
+`execute` 没有绑定参数时使用文本协议，支持 `SAVEPOINT`、`RELEASE SAVEPOINT`
+和 `ROLLBACK TO SAVEPOINT`。有绑定参数时继续使用预处理协议。此规则同时适用于连接池和
+事务句柄；路由、超时、指标和 `ai-strict` 检查保持原有行为。
+
+`execute` uses the text protocol for statements without bound arguments,
+including `SAVEPOINT`, `RELEASE SAVEPOINT`, and `ROLLBACK TO SAVEPOINT`.
+Statements with bound arguments keep using prepared statements. This applies
+to pooled and transaction handles while preserving routing, timeouts, metrics,
+and `ai-strict` checks.
+
 ## Streaming
 
 fetch is the primary large-result API. It is lazy and decodes one row at a
