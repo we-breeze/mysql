@@ -1,4 +1,5 @@
 //! SQLx-backed implementation of the public MySQL contract.
+mod transaction_scope;
 
 use std::{borrow::Cow, future::Future, str::FromStr};
 
@@ -346,37 +347,6 @@ impl MysqlService {
         Ok(values)
     }
 
-    /// Runs one scoped transaction, committing on Ok and rolling back on Err.
-    pub async fn with_transaction<T, F>(&self, operation: F) -> MysqlResult<T>
-    where
-        T: Send,
-        F: for<'transaction> AsyncFnOnce(
-                &'transaction mut MysqlTransactionService,
-            ) -> MysqlResult<T>
-            + Send,
-    {
-        let observation = Observation::transaction(self.metrics.transaction);
-        let result = run_with_timeout(self.query_timeout, async move {
-            let mut transaction = self.begin(self.routing.clone()).await?;
-            match operation(&mut transaction).await {
-                Ok(value) => {
-                    transaction.commit().await?;
-                    Ok(value)
-                }
-                Err(operation) => match transaction.rollback().await {
-                    Ok(()) => Err(operation),
-                    Err(rollback) => Err(MysqlError::TransactionRollback {
-                        operation: Box::new(operation),
-                        rollback: Box::new(rollback),
-                    }),
-                },
-            }
-        })
-        .await;
-        observation.finish(result.is_ok());
-        result
-    }
-
     pub async fn ping(&self) -> MysqlResult<()> {
         run_with_timeout(self.query_timeout, async move {
             sqlx::query("SELECT 1")
@@ -408,18 +378,6 @@ impl MysqlService {
             pool.close().await;
         }
         self.master_pool.close().await;
-    }
-
-    async fn begin(&self, route: Option<QueryRouting>) -> MysqlResult<MysqlTransactionService> {
-        self.master_pool
-            .begin()
-            .await
-            .map(|inner| MysqlTransactionService {
-                inner: Some(inner),
-                route,
-                query_timeout: self.query_timeout,
-            })
-            .map_err(map_sqlx_error)
     }
 }
 
@@ -493,6 +451,19 @@ impl Mysql for MysqlService {
             + Send,
     {
         MysqlService::with_transaction(self, operation).await
+    }
+
+    async fn with_transaction_options<T, F>(
+        &self,
+        options: crate::MysqlTransactionOptions,
+        operation: F,
+    ) -> MysqlResult<T>
+    where
+        T: Send,
+        F: for<'transaction> AsyncFnOnce(&'transaction mut Self::Transaction) -> MysqlResult<T>
+            + Send,
+    {
+        MysqlService::with_transaction_options(self, options, operation).await
     }
 }
 
@@ -871,6 +842,9 @@ mod statement_cache_tests;
 
 #[cfg(all(test, feature = "integration-tests"))]
 mod execute_protocol_tests;
+
+#[cfg(all(test, feature = "integration-tests"))]
+mod transaction_options_tests;
 
 #[cfg(test)]
 mod read_query_check_tests;
