@@ -482,6 +482,50 @@ pub(crate) fn check_execute_autocommit(sql: &str) -> MysqlResult<()> {
     Ok(())
 }
 
+#[cfg(feature = "ai-strict")]
+fn execute_keyword(sql: &str) -> &str {
+    sql.trim_start()
+        .split(|character: char| !character.is_alphanumeric() && !matches!(character, '_' | '$'))
+        .next()
+        .unwrap_or_default()
+}
+
+#[cfg(feature = "ai-strict")]
+fn check_execute_statement(sql: &str) -> MysqlResult<()> {
+    let keyword = execute_keyword(sql);
+    if ["insert", "update", "delete", "replace", "select"]
+        .iter()
+        .any(|allowed| keyword.eq_ignore_ascii_case(allowed))
+    {
+        return Ok(());
+    }
+    Err(crate::routing::invalid(
+        "execute only accepts INSERT, UPDATE, DELETE, REPLACE, or SELECT",
+    ))
+}
+
+#[cfg(feature = "ai-strict")]
+pub(crate) fn check_transaction_execute(sql: &str) -> MysqlResult<()> {
+    check_execute_autocommit(sql)?;
+    let keyword = execute_keyword(sql);
+    if [
+        "commit",
+        "rollback",
+        "begin",
+        "start",
+        "savepoint",
+        "release",
+    ]
+    .iter()
+    .any(|control| keyword.eq_ignore_ascii_case(control))
+    {
+        return Err(crate::routing::invalid(
+            "transaction control is managed by MysqlService; use tx.with_transaction(...) for nested transactions (SAVEPOINT), or return Ok/Err from the callback to commit/roll back the current scope",
+        ));
+    }
+    check_execute_statement(sql)
+}
+
 fn prepare_execute_query<'sql, A>(
     sql: &'sql str,
     arguments: A,
@@ -493,27 +537,12 @@ where
     #[cfg(feature = "ai-strict")]
     {
         check_execute_autocommit(sql)?;
-        let trimmed = sql.trim_start();
-        if trimmed
-            .get(..6)
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("commit"))
-        {
+        if execute_keyword(sql).eq_ignore_ascii_case("commit") {
             return Err(crate::routing::invalid(
                 "MySQL uses autocommit by default; a separate COMMIT is not needed. Use with_transaction for explicit transactions",
             ));
         }
-        if !["insert", "update", "delete", "replace", "select"]
-            .iter()
-            .any(|keyword| {
-                trimmed
-                    .get(..keyword.len())
-                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case(keyword))
-            })
-        {
-            return Err(crate::routing::invalid(
-                "execute only accepts INSERT, UPDATE, DELETE, REPLACE, or SELECT; use with_transaction for other SQL",
-            ));
-        }
+        check_execute_statement(sql)?;
     }
     prepare_query(sql, arguments, route)
 }

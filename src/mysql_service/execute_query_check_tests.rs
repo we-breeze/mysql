@@ -1,5 +1,22 @@
 use super::*;
 
+const STATEMENT_REASON: &str = "execute only accepts INSERT, UPDATE, DELETE, REPLACE, or SELECT";
+const TRANSACTION_CONTROL_REASON: &str = "transaction control is managed by MysqlService; use tx.with_transaction(...) for nested transactions (SAVEPOINT), or return Ok/Err from the callback to commit/roll back the current scope";
+
+fn assert_optional_rejection(result: MysqlResult<MysqlExecution>, reason: &str, sql: &str) {
+    if cfg!(feature = "ai-strict") {
+        assert_eq!(
+            result.unwrap_err(),
+            MysqlError::InvalidQuery {
+                reason: reason.to_string(),
+            },
+            "{sql}",
+        );
+    } else {
+        assert!(matches!(result, Err(MysqlError::Database { .. })), "{sql}");
+    }
+}
+
 #[test]
 fn execute_accepts_dml_and_select_prefixes_with_whitespace_and_mixed_case() {
     for sql in [
@@ -8,9 +25,13 @@ fn execute_accepts_dml_and_select_prefixes_with_whitespace_and_mixed_case() {
         "\t\nDeLeTe FROM tasks WHERE id = ?",
         "\r\nreplace INTO tasks (id) VALUES (?)",
         " \nSeLeCt ? AS value",
+        "SELECT(?)",
+        "SELECT/* inline comment */?",
     ] {
         let (prepared, _) = prepare_execute_query(sql, (1_i64,), None).unwrap();
         assert_eq!(prepared, sql);
+        #[cfg(feature = "ai-strict")]
+        check_transaction_execute(sql).unwrap();
     }
 }
 
@@ -26,13 +47,18 @@ fn execute_prefix_check_is_optional() {
         "/* write */ INSERT INTO tasks (id) VALUES (1)",
         "WITH task_ids AS (SELECT 1) DELETE FROM tasks WHERE id IN (SELECT * FROM task_ids)",
         "更新 tasks",
+        "SELECTED 1",
+        "SELECT_value",
+        "SELECT$variable",
+        "SELECTé",
+        "INSERTED INTO tasks VALUES (1)",
     ] {
         let result = prepare_execute_query(sql, (), None);
         if cfg!(feature = "ai-strict") {
             assert_eq!(
                 result.unwrap_err(),
                 MysqlError::InvalidQuery {
-                    reason: "execute only accepts INSERT, UPDATE, DELETE, REPLACE, or SELECT; use with_transaction for other SQL".to_string(),
+                    reason: STATEMENT_REASON.to_string(),
                 },
                 "{sql}",
             );
@@ -43,7 +69,7 @@ fn execute_prefix_check_is_optional() {
 }
 
 #[tokio::test]
-async fn only_service_execute_applies_the_optional_prefix_check() {
+async fn service_execute_applies_the_optional_prefix_check() {
     let mysql = MysqlService::connect_lazy("mysql://user:secret@127.0.0.1:1/test").unwrap();
     let routed = mysql
         .with_route(|_: &str, _: &dyn MysqlRouteKey| Ok("tasks_01"))
@@ -60,7 +86,7 @@ async fn only_service_execute_applies_the_optional_prefix_check() {
             ),
             (
                 Mysql::execute(service, "ROLLBACK", ()).await,
-                "execute only accepts INSERT, UPDATE, DELETE, REPLACE, or SELECT; use with_transaction for other SQL",
+                STATEMENT_REASON,
             ),
         ] {
             if cfg!(feature = "ai-strict") {
@@ -75,34 +101,90 @@ async fn only_service_execute_applies_the_optional_prefix_check() {
             }
         }
     }
+}
 
+#[tokio::test]
+async fn transaction_execute_applies_the_optional_whitelist_and_nested_transaction_guidance() {
     // An absent connection lets us distinguish query rejection from execution
     // without sending any SQL to a database.
     let mut transaction = MysqlTransactionService {
         inner: None,
-        route: routed.routing.clone(),
+        route: None,
         query_timeout: std::time::Duration::from_secs(1),
     };
-    assert!(matches!(
-        transaction.execute("SET @task_id = ?", (1_i64,)).await,
-        Err(MysqlError::Database { .. }),
-    ));
-    assert!(matches!(
-        transaction
-            .route(2)
-            .execute("SET @task_id = ?", (2_i64,))
-            .await,
-        Err(MysqlError::Database { .. }),
-    ));
-    for sql in ["COMMIT", "ROLLBACK"] {
-        assert!(matches!(
+    for sql in [
+        "INSERT INTO tasks (id) VALUES (?)",
+        "  UpDaTe tasks SET id = ?",
+        "\tDELETE FROM tasks WHERE id = ?",
+        "\nREPLACE INTO tasks (id) VALUES (?)",
+        "SELECT ? AS value",
+        "SELECT 'COMMIT; ROLLBACK; SAVEPOINT scope'",
+        "SELECT(?)",
+        "SELECT/* inline comment */?",
+    ] {
+        assert!(
+            matches!(
+                transaction.execute(sql, (1_i64,)).await,
+                Err(MysqlError::Database { .. }),
+            ),
+            "{sql}"
+        );
+        assert!(
+            matches!(
+                transaction.route(2).execute(sql, (1_i64,)).await,
+                Err(MysqlError::Database { .. }),
+            ),
+            "{sql}"
+        );
+    }
+    for sql in [
+        "COMMIT",
+        " \nCoMmIt WORK AND CHAIN;",
+        "ROLLBACK",
+        "ROLLBACK WORK",
+        "ROLLBACK TO scope",
+        "\tRoLlBaCk TO SAVEPOINT scope",
+        "BEGIN",
+        "BEGIN WORK",
+        " START TRANSACTION",
+        "START\nTRANSACTION READ ONLY",
+        "SAVEPOINT scope",
+        " \nSaVePoInT scope;",
+        "RELEASE SAVEPOINT scope",
+        "release\tsavepoint scope",
+    ] {
+        assert_optional_rejection(
             transaction.execute(sql, ()).await,
-            Err(MysqlError::Database { .. }),
-        ));
-        assert!(matches!(
+            TRANSACTION_CONTROL_REASON,
+            sql,
+        );
+        assert_optional_rejection(
             transaction.route(2).execute(sql, ()).await,
-            Err(MysqlError::Database { .. }),
-        ));
+            TRANSACTION_CONTROL_REASON,
+            sql,
+        );
+    }
+    for sql in [
+        "",
+        " \t\n",
+        "SET @task_id = 1",
+        "CREATE TABLE tasks (id BIGINT)",
+        "DROP TABLE tasks",
+        "/* write */ INSERT INTO tasks (id) VALUES (1)",
+        "WITH task_ids AS (SELECT 1) DELETE FROM tasks WHERE id IN (SELECT * FROM task_ids)",
+        "SELECTED 1",
+        "SELECT_value",
+        "SELECT$variable",
+        "SELECTé",
+        "COMMITTED",
+        "更新 tasks",
+    ] {
+        assert_optional_rejection(transaction.execute(sql, ()).await, STATEMENT_REASON, sql);
+        assert_optional_rejection(
+            transaction.route(2).execute(sql, ()).await,
+            STATEMENT_REASON,
+            sql,
+        );
     }
 }
 

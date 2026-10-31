@@ -199,11 +199,12 @@ standard usage checks:
 brz-mysql = { version = "=0.0.22", features = ["ai-strict"] }
 ```
 
-`execute` accepts SQL starting with `insert`, `update`, `delete`, `replace`, or
-`select`, ignoring leading whitespace and ASCII letter case. Other SQL returns
-`MysqlError::InvalidQuery` before connecting, with a message directing the caller
-to `with_transaction`. `execute` accepts `SELECT` but returns only execution
-metadata; use `fetch_*` to retrieve rows.
+Both pooled and transaction `execute` accept SQL whose first keyword is `insert`,
+`update`, `delete`, `replace`, or `select`, ignoring leading whitespace and ASCII
+letter case. Other SQL returns `MysqlError::InvalidQuery` before execution.
+Keyword boundaries are checked, so identifiers such as `SELECTED` do not match
+`SELECT`. `execute` accepts `SELECT` but returns only execution metadata; use
+`fetch_*` to retrieve rows.
 
 Outside transactions, `execute("COMMIT", ())` returns a dedicated error explaining
 that MySQL uses autocommit by default and needs no separate `COMMIT`, and directs
@@ -220,12 +221,13 @@ sending SQL to MySQL. This literal substring check also matches strings and
 comments, while mixed case and other whitespace are not matched. It does not
 enforce SELECT-only queries.
 
-Calls through `Mysql` and routed service handles use the same checks. Transaction
-`execute` calls, including routed transaction views, are not subject to the
-ordinary service prefix restriction: `COMMIT` and `ROLLBACK` remain allowed
-inside transactions. These commands end the current transaction immediately;
-later SQL in the closure is no longer protected by that transaction.
-Transaction fetch queries allow `FOR UPDATE`.
+Calls through `Mysql`, routed service handles, and transaction views use the same
+statement whitelist. Inside transactions, manual `COMMIT`, `ROLLBACK`, `BEGIN`,
+`START TRANSACTION`, `SAVEPOINT`, `RELEASE SAVEPOINT`, and `ROLLBACK TO [SAVEPOINT]`
+return an error directing callers to `tx.with_transaction(...)` for nested
+transactions. Return `Ok`/`Err` from the callback to commit/roll back the current
+scope. These checks also apply inside nested and routed transactions; automatic
+SAVEPOINT management still works. Transaction fetch queries allow `FOR UPDATE`.
 
 This is a simple prefix check: it does not parse SQL, skip comments, or inspect
 later statements. A leading comment or `WITH` does not match an allowed prefix.
@@ -320,15 +322,17 @@ available as aliases. Generic code requiring nesting can add a
 `with_transaction` method.
 
 
-`execute` 没有绑定参数时使用文本协议，支持 `SAVEPOINT`、`RELEASE SAVEPOINT`
-和 `ROLLBACK TO SAVEPOINT`。有绑定参数时继续使用预处理协议。此规则同时适用于连接池和
-事务句柄；路由、超时、指标和 `ai-strict` 检查保持原有行为。
+`execute` 没有绑定参数时使用文本协议；未开启 `ai-strict` 时支持手动执行
+`SAVEPOINT`、`RELEASE SAVEPOINT` 和 `ROLLBACK TO SAVEPOINT`。开启 `ai-strict`
+后请使用 `tx.with_transaction(...)` 创建嵌套事务。有绑定参数时继续使用预处理协议。
+此规则同时适用于连接池和事务句柄，并保留路由、超时和指标行为。
 
-`execute` uses the text protocol for statements without bound arguments,
-including `SAVEPOINT`, `RELEASE SAVEPOINT`, and `ROLLBACK TO SAVEPOINT`.
-Statements with bound arguments keep using prepared statements. This applies
-to pooled and transaction handles while preserving routing, timeouts, metrics,
-and `ai-strict` checks.
+`execute` uses the text protocol for statements without bound arguments.
+Without `ai-strict`, this includes manual `SAVEPOINT`, `RELEASE SAVEPOINT`, and
+`ROLLBACK TO SAVEPOINT`. With `ai-strict`, use `tx.with_transaction(...)` for
+nested transactions. Statements with bound arguments keep using prepared
+statements. This applies to pooled and transaction handles while preserving
+routing, timeouts, and metrics.
 
 ## Streaming
 
