@@ -82,6 +82,7 @@ async fn parameterized_execute_keeps_prepared_binding() {
 }
 
 #[tokio::test]
+#[cfg(not(feature = "ai-strict"))]
 async fn manual_savepoints_keep_one_connection_and_outer_commit_or_rollback() {
     let mysql = setup("brz_execute_savepoint").await;
     mysql
@@ -143,11 +144,14 @@ async fn parameterless_execute_preserves_explicit_pool_and_transaction_routes() 
     routed
         .with_transaction(async |tx| {
             let mut scoped = tx.route(7_u64);
-            scoped.execute("SAVEPOINT routed_scope", ()).await?;
             scoped
-                .execute("INSERT INTO {{brz_execute_route}} (id) VALUES (2)", ())
+                .with_transaction(async |inner| {
+                    inner
+                        .execute("INSERT INTO {{brz_execute_route}} (id) VALUES (2)", ())
+                        .await?;
+                    Ok(())
+                })
                 .await?;
-            scoped.execute("RELEASE SAVEPOINT routed_scope", ()).await?;
             Ok(())
         })
         .await
@@ -158,5 +162,67 @@ async fn parameterless_execute_preserves_explicit_pool_and_transaction_routes() 
         .await
         .unwrap();
     assert_eq!(row.get::<i64, _>(0), 2);
+    mysql.close().await;
+}
+
+#[cfg(feature = "ai-strict")]
+#[tokio::test]
+async fn rejected_manual_controls_preserve_the_outer_and_nested_transaction_scopes() {
+    let mysql = setup("brz_execute_strict").await;
+    mysql
+        .with_transaction(async |outer| {
+            let connection: u64 = outer.fetch_one("SELECT CONNECTION_ID()", ()).await?;
+            outer
+                .execute("INSERT INTO brz_execute_strict (id) VALUES (1)", ())
+                .await?;
+            let result: MysqlResult<()> = outer
+                .with_transaction(async |inner| {
+                    inner
+                        .execute("INSERT INTO brz_execute_strict (id) VALUES (2)", ())
+                        .await?;
+                    for sql in [
+                        "COMMIT",
+                        "ROLLBACK",
+                        "BEGIN",
+                        "START TRANSACTION",
+                        "SAVEPOINT manual_scope",
+                        "ROLLBACK TO SAVEPOINT manual_scope",
+                        "RELEASE SAVEPOINT manual_scope",
+                    ] {
+                        for result in [
+                            inner.execute(sql, ()).await,
+                            inner.route(7_u64).execute(sql, ()).await,
+                        ] {
+                            let Err(MysqlError::InvalidQuery { reason }) = result else {
+                                panic!("transaction control must be rejected: {sql}");
+                            };
+                            assert!(reason.contains("tx.with_transaction(...)"), "{reason}");
+                        }
+                    }
+                    inner
+                        .with_transaction(async |deep| {
+                            let same: u64 = deep.fetch_one("SELECT CONNECTION_ID()", ()).await?;
+                            assert_eq!(connection, same);
+                            deep.execute("INSERT INTO brz_execute_strict (id) VALUES (4)", ())
+                                .await?;
+                            Ok(())
+                        })
+                        .await?;
+                    Err(MysqlError::RowNotFound)
+                })
+                .await;
+            assert_eq!(result, Err(MysqlError::RowNotFound));
+            outer
+                .execute("INSERT INTO brz_execute_strict (id) VALUES (3)", ())
+                .await?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let ids: Vec<i64> = mysql
+        .fetch_all("SELECT id FROM brz_execute_strict ORDER BY id", ())
+        .await
+        .unwrap();
+    assert_eq!(ids, [1, 3]);
     mysql.close().await;
 }

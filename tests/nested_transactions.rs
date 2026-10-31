@@ -4,6 +4,7 @@ use brz_mysql::{
     FromMysqlRow, MysqlError, MysqlNestedTransaction, MysqlResult, MysqlService,
     MysqlServiceOptions, MysqlTransaction,
 };
+use sqlx::{Connection, Executor};
 use std::time::Duration;
 
 #[derive(Debug, FromMysqlRow)]
@@ -13,23 +14,25 @@ struct Number {
 
 async fn setup(table: &str) -> Option<MysqlService> {
     let url = std::env::var("BREEZE_MYSQL_TEST_URL").ok()?;
+    // Fixture DDL stays outside the application's strict statement whitelist.
+    let mut fixture = sqlx::MySqlConnection::connect(&url).await.unwrap();
+    fixture
+        .execute(
+            format!("CREATE TABLE IF NOT EXISTS {table} (id BIGINT PRIMARY KEY) ENGINE=InnoDB")
+                .as_str(),
+        )
+        .await
+        .unwrap();
+    fixture.close().await.unwrap();
     let db = MysqlService::connect_with_options(
         &url,
         MysqlServiceOptions::default().with_max_connections(1),
     )
     .await
     .unwrap();
-    db.with_transaction(async |tx| {
-        tx.execute(
-            format!("CREATE TABLE IF NOT EXISTS {table} (id BIGINT PRIMARY KEY) ENGINE=InnoDB"),
-            (),
-        )
-        .await?;
-        tx.execute(format!("DELETE FROM {table}"), ()).await?;
-        Ok(())
-    })
-    .await
-    .unwrap();
+    db.execute(format!("DELETE FROM {table}"), ())
+        .await
+        .unwrap();
     Some(db)
 }
 

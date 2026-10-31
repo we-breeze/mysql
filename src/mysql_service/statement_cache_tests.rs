@@ -58,10 +58,7 @@ async fn assert_statements_closed(pool: &MySqlPool) {
 }
 
 async fn exercise_queries(mysql: &MysqlService) {
-    mysql
-        .execute("SET @brz_mysql_cache_test = ?", (7_u64,))
-        .await
-        .unwrap();
+    mysql.execute("SELECT ?", (7_u64,)).await.unwrap();
     for value in 1..=5_u64 {
         let row: u64 = mysql.fetch_one("SELECT ?", (value,)).await.unwrap();
         assert_eq!(row, value);
@@ -135,9 +132,7 @@ async fn transactions_release_statements_on_commit_and_rollback() {
         MysqlService::connect_lazy_read_write_with_options(&url, &url, options()).unwrap();
     service
         .with_transaction(async |transaction| {
-            transaction
-                .execute("SET @brz_mysql_cache_test = ?", (7_u64,))
-                .await?;
+            transaction.execute("SELECT ?", (7_u64,)).await?;
             for value in 1..=5_u64 {
                 let row: u64 = transaction.fetch_one("SELECT ?", (value,)).await?;
                 assert_eq!(row, value);

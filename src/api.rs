@@ -279,6 +279,9 @@ pub trait Mysql: Send + Sync {
 #[allow(async_fn_in_trait)]
 pub trait MysqlTransaction: Send {
     /// Uses the same protocol selection as [`Mysql::execute`] on this connection.
+    /// With `ai-strict`, accepts only INSERT, UPDATE, DELETE, REPLACE, or SELECT.
+    /// Use [`MysqlNestedTransaction::with_transaction`] for nested SAVEPOINT scopes;
+    /// return Ok/Err from the callback to complete the current scope.
     async fn execute<S, A>(&mut self, sql: S, arguments: A) -> MysqlResult<MysqlExecution>
     where
         S: AsRef<str> + Send,
