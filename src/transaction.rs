@@ -133,33 +133,48 @@ impl MysqlNestedTransaction for MysqlTransactionService {
     }
 }
 
-impl MysqlTransaction for MysqlTransactionService {
-    async fn execute<S, A>(&mut self, sql: S, arguments: A) -> MysqlResult<MysqlExecution>
+impl MysqlTransactionService {
+    pub(crate) async fn execute_with_route<S, A>(
+        &mut self,
+        sql: S,
+        arguments: A,
+        route: Option<&QueryRouting>,
+    ) -> MysqlResult<MysqlExecution>
     where
         S: AsRef<str> + Send,
         A: MysqlArgs + Send,
     {
-        let observation = Observation::query(None, sql.as_ref());
+        let mut observation = Observation::query(None, "execute", sql.as_ref());
         let result = run_with_timeout(self.query_timeout, async {
             #[cfg(feature = "ai-strict")]
-            check_transaction_execute(sql.as_ref())?;
-            let (sql, arguments) = prepare_query(sql.as_ref(), arguments, self.route.as_ref())?;
+            if let Err(error) = check_transaction_execute(sql.as_ref()) {
+                observation.capture_parameters(&arguments);
+                return Err(error);
+            }
+            let (sql, arguments) =
+                prepare_query(sql.as_ref(), arguments, route, Some(&mut observation))?;
             execute_query(&mut **self.inner()?, sql.as_ref(), arguments).await
         })
         .await;
-        observation.finish(result.is_ok());
+        observation.finish_result(&result);
         result
     }
 
-    async fn fetch_optional<S, A, T>(&mut self, sql: S, arguments: A) -> MysqlResult<Option<T>>
+    pub(crate) async fn fetch_optional_with_route<S, A, T>(
+        &mut self,
+        sql: S,
+        arguments: A,
+        route: Option<&QueryRouting>,
+    ) -> MysqlResult<Option<T>>
     where
         S: AsRef<str> + Send,
         A: MysqlArgs + Send,
         T: FromMysqlRow + Send,
     {
-        let observation = Observation::query(None, sql.as_ref());
+        let mut observation = Observation::query(None, "fetch_optional", sql.as_ref());
         let result = run_with_timeout(self.query_timeout, async {
-            let (sql, arguments) = prepare_query(sql.as_ref(), arguments, self.route.as_ref())?;
+            let (sql, arguments) =
+                prepare_query(sql.as_ref(), arguments, route, Some(&mut observation))?;
             sqlx::query_with::<MySql, _>(sql.as_ref(), arguments)
                 .fetch_optional(&mut **self.inner()?)
                 .await
@@ -168,19 +183,25 @@ impl MysqlTransaction for MysqlTransactionService {
                 .transpose()
         })
         .await;
-        observation.finish(result.is_ok());
+        observation.finish_result(&result);
         result
     }
 
-    async fn fetch_one<S, A, T>(&mut self, sql: S, arguments: A) -> MysqlResult<T>
+    pub(crate) async fn fetch_one_with_route<S, A, T>(
+        &mut self,
+        sql: S,
+        arguments: A,
+        route: Option<&QueryRouting>,
+    ) -> MysqlResult<T>
     where
         S: AsRef<str> + Send,
         A: MysqlArgs + Send,
         T: FromMysqlRow + Send,
     {
-        let observation = Observation::query(None, sql.as_ref());
+        let mut observation = Observation::query(None, "fetch_one", sql.as_ref());
         let result = run_with_timeout(self.query_timeout, async {
-            let (sql, arguments) = prepare_query(sql.as_ref(), arguments, self.route.as_ref())?;
+            let (sql, arguments) =
+                prepare_query(sql.as_ref(), arguments, route, Some(&mut observation))?;
             sqlx::query_with::<MySql, _>(sql.as_ref(), arguments)
                 .fetch_optional(&mut **self.inner()?)
                 .await
@@ -190,14 +211,16 @@ impl MysqlTransaction for MysqlTransactionService {
                 .ok_or(MysqlError::RowNotFound)
         })
         .await;
-        observation.finish(result.is_ok());
+        observation.finish_result(&result);
         result
     }
 
-    fn fetch<'transaction, S, A, T>(
+    pub(crate) fn fetch_with_route<'transaction, S, A, T>(
         &'transaction mut self,
         sql: S,
         arguments: A,
+        route: Option<QueryRouting>,
+        operation: &'static str,
     ) -> impl Stream<Item = MysqlResult<T>> + Send + 'transaction
     where
         S: AsRef<str> + Send + 'transaction,
@@ -205,16 +228,18 @@ impl MysqlTransaction for MysqlTransactionService {
         T: FromMysqlRow + Send + 'transaction,
     {
         stream! {
-            let observation = Observation::query(None, sql.as_ref());
+            let mut observation = Observation::query(None, operation, sql.as_ref());
             let deadline = tokio::time::Instant::now() + self.query_timeout;
             let mut success = true;
             let (sql, arguments) = match prepare_query(
                 sql.as_ref(),
                 arguments,
-                self.route.as_ref(),
+                route.as_ref(),
+                Some(&mut observation),
             ) {
                 Ok(prepared) => prepared,
                 Err(error) => {
+                    observation.error(&error);
                     yield Err(error);
                     return;
                 }
@@ -222,6 +247,7 @@ impl MysqlTransaction for MysqlTransactionService {
             let transaction = match self.inner() {
                 Ok(transaction) => transaction,
                 Err(error) => {
+                    observation.error(&error);
                     yield Err(error);
                     return;
                 }
@@ -234,10 +260,14 @@ impl MysqlTransaction for MysqlTransactionService {
                     Ok(Some(row)) => {
                         let result = row.map_err(map_sqlx_error).and_then(decode_row);
                         success &= result.is_ok();
+                        if let Err(error) = &result {
+                            observation.error(error);
+                        }
                         yield result;
                     }
                     Ok(None) => break,
                     Err(_) => {
+                        observation.error(&MysqlError::QueryTimedOut);
                         observation.finish(false);
                         yield Err(MysqlError::QueryTimedOut);
                         return;
@@ -247,6 +277,54 @@ impl MysqlTransaction for MysqlTransactionService {
             observation.finish(success);
         }
     }
+}
+
+impl MysqlTransaction for MysqlTransactionService {
+    async fn execute<S, A>(&mut self, sql: S, arguments: A) -> MysqlResult<MysqlExecution>
+    where
+        S: AsRef<str> + Send,
+        A: MysqlArgs + Send,
+    {
+        let route = self.route.clone();
+        self.execute_with_route(sql, arguments, route.as_ref())
+            .await
+    }
+
+    async fn fetch_optional<S, A, T>(&mut self, sql: S, arguments: A) -> MysqlResult<Option<T>>
+    where
+        S: AsRef<str> + Send,
+        A: MysqlArgs + Send,
+        T: FromMysqlRow + Send,
+    {
+        let route = self.route.clone();
+        self.fetch_optional_with_route(sql, arguments, route.as_ref())
+            .await
+    }
+
+    async fn fetch_one<S, A, T>(&mut self, sql: S, arguments: A) -> MysqlResult<T>
+    where
+        S: AsRef<str> + Send,
+        A: MysqlArgs + Send,
+        T: FromMysqlRow + Send,
+    {
+        let route = self.route.clone();
+        self.fetch_one_with_route(sql, arguments, route.as_ref())
+            .await
+    }
+
+    fn fetch<'transaction, S, A, T>(
+        &'transaction mut self,
+        sql: S,
+        arguments: A,
+    ) -> impl Stream<Item = MysqlResult<T>> + Send + 'transaction
+    where
+        S: AsRef<str> + Send + 'transaction,
+        A: MysqlArgs + Send + 'transaction,
+        T: FromMysqlRow + Send + 'transaction,
+    {
+        let route = self.route.clone();
+        self.fetch_with_route(sql, arguments, route, "fetch")
+    }
 
     async fn fetch_all<S, A, T>(&mut self, sql: S, arguments: A) -> MysqlResult<Vec<T>>
     where
@@ -254,7 +332,8 @@ impl MysqlTransaction for MysqlTransactionService {
         A: MysqlArgs + Send,
         T: FromMysqlRow + Send,
     {
-        let rows = self.fetch(sql, arguments);
+        let route = self.route.clone();
+        let rows = self.fetch_with_route(sql, arguments, route, "fetch_all");
         pin_mut!(rows);
         let mut values = Vec::new();
         while let Some(row) = rows.next().await {

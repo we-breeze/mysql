@@ -6,6 +6,7 @@ use sqlx::{
     Arguments as _, Encode, MySql, Type, mysql::MySqlArguments as SqlxMySqlArguments,
     types::BigDecimal,
 };
+use std::fmt;
 
 use crate::{MysqlError, MysqlResult};
 
@@ -134,6 +135,13 @@ pub trait MysqlValue: Send {
     fn encoded_size_hint(&self) -> usize {
         0
     }
+
+    /// Format the value for statement error logs. Custom values can override
+    /// the default type description without adding a Debug bound.
+    #[doc(hidden)]
+    fn fmt_log_value(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "<{}>", std::any::type_name::<Self>())
+    }
 }
 
 /// One complete heterogeneous MySQL parameter list.
@@ -158,6 +166,18 @@ pub trait MysqlArgs: Send {
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Format parameters for statement error logs without requiring Debug.
+    /// Custom argument containers can override this default representation.
+    #[doc(hidden)]
+    fn fmt_log_arguments(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "<{} parameters: {}>",
+            self.len(),
+            std::any::type_name::<Self>()
+        )
+    }
 }
 
 /// Internal encoder exposed only so application newtypes can implement
@@ -166,13 +186,18 @@ pub trait MysqlArgs: Send {
 pub struct MysqlValueWriter {
     inner: SqlxMySqlArguments,
     position: usize,
+    parameters: Option<String>,
 }
 
 impl MysqlValueWriter {
     pub(crate) fn with_capacity(arguments: usize, bytes: usize) -> Self {
         let mut inner = SqlxMySqlArguments::default();
         inner.reserve(arguments, bytes);
-        Self { inner, position: 0 }
+        Self {
+            inner,
+            position: 0,
+            parameters: None,
+        }
     }
 
     pub fn push<V: MysqlValue>(&mut self, value: V) -> MysqlResult<()> {
@@ -181,6 +206,18 @@ impl MysqlValueWriter {
 
     pub(crate) fn into_inner(self) -> SqlxMySqlArguments {
         self.inner
+    }
+
+    fn record_value<V: MysqlValue>(&mut self, value: &V) {
+        use fmt::Write as _;
+        if let Some(parameters) = &mut self.parameters {
+            if self.position > 0 {
+                parameters.push_str(", ");
+            }
+            if write!(parameters, "{}", ValueLog(value)).is_err() {
+                parameters.push_str("<unable to format parameter>");
+            }
+        }
     }
 
     fn push_sqlx<'query, T>(&mut self, value: T) -> MysqlResult<()>
@@ -198,6 +235,14 @@ impl MysqlValueWriter {
     }
 }
 
+struct ValueLog<'value, V>(&'value V);
+
+impl<V: MysqlValue> fmt::Display for ValueLog<'_, V> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt_log_value(formatter)
+    }
+}
+
 /// JSON input/output wrapper.
 ///
 /// On input, SQLx serializes the wrapped value directly into its MySQL
@@ -212,10 +257,39 @@ impl<T> Json<T> {
     }
 }
 
+macro_rules! log_value {
+    (display) => {
+        fn fmt_log_value(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            fmt::Display::fmt(self, formatter)
+        }
+    };
+    (debug) => {
+        fn fmt_log_value(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            fmt::Debug::fmt(self, formatter)
+        }
+    };
+    (quoted) => {
+        fn fmt_log_value(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(formatter, "\"{self}\"")
+        }
+    };
+    (bytes) => {
+        fn fmt_log_value(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("0x")?;
+            for byte in self.iter() {
+                write!(formatter, "{byte:02x}")?;
+            }
+            Ok(())
+        }
+    };
+}
+
 macro_rules! signed_value {
     ($($type:ty),+ $(,)?) => {$(
         impl MysqlValue for $type {
+            log_value!(display);
             fn write(self, writer: &mut MysqlValueWriter) -> MysqlResult<()> {
+                writer.record_value(&self);
                 writer.push_sqlx(self)
             }
 
@@ -233,7 +307,9 @@ macro_rules! signed_value {
 macro_rules! unsigned_value {
     ($($type:ty),+ $(,)?) => {$(
         impl MysqlValue for $type {
+            log_value!(display);
             fn write(self, writer: &mut MysqlValueWriter) -> MysqlResult<()> {
+                writer.record_value(&self);
                 writer.push_sqlx(self)
             }
 
@@ -252,7 +328,9 @@ signed_value!(i8, i16, i32, i64);
 unsigned_value!(u8, u16, u32, u64);
 
 impl MysqlValue for isize {
+    log_value!(display);
     fn write(self, writer: &mut MysqlValueWriter) -> MysqlResult<()> {
+        writer.record_value(&self);
         writer.push_sqlx(self as i64)
     }
 
@@ -266,7 +344,9 @@ impl MysqlValue for isize {
 }
 
 impl MysqlValue for usize {
+    log_value!(display);
     fn write(self, writer: &mut MysqlValueWriter) -> MysqlResult<()> {
+        writer.record_value(&self);
         writer.push_sqlx(self as u64)
     }
 
@@ -280,7 +360,9 @@ impl MysqlValue for usize {
 }
 
 impl MysqlValue for bool {
+    log_value!(display);
     fn write(self, writer: &mut MysqlValueWriter) -> MysqlResult<()> {
+        writer.record_value(&self);
         writer.push_sqlx(self)
     }
 
@@ -294,7 +376,9 @@ impl MysqlValue for bool {
 }
 
 impl MysqlValue for f32 {
+    log_value!(display);
     fn write(self, writer: &mut MysqlValueWriter) -> MysqlResult<()> {
+        writer.record_value(&self);
         writer.push_sqlx(self)
     }
 
@@ -308,7 +392,9 @@ impl MysqlValue for f32 {
 }
 
 impl MysqlValue for f64 {
+    log_value!(display);
     fn write(self, writer: &mut MysqlValueWriter) -> MysqlResult<()> {
+        writer.record_value(&self);
         writer.push_sqlx(self)
     }
 
@@ -322,7 +408,9 @@ impl MysqlValue for f64 {
 }
 
 impl MysqlValue for String {
+    log_value!(debug);
     fn write(self, writer: &mut MysqlValueWriter) -> MysqlResult<()> {
+        writer.record_value(&self);
         writer.push_sqlx(self)
     }
 
@@ -336,7 +424,9 @@ impl MysqlValue for String {
 }
 
 impl MysqlValue for &str {
+    log_value!(debug);
     fn write(self, writer: &mut MysqlValueWriter) -> MysqlResult<()> {
+        writer.record_value(&self);
         writer.push_sqlx(self)
     }
 
@@ -350,7 +440,9 @@ impl MysqlValue for &str {
 }
 
 impl MysqlValue for Vec<u8> {
+    log_value!(bytes);
     fn write(self, writer: &mut MysqlValueWriter) -> MysqlResult<()> {
+        writer.record_value(&self);
         writer.push_sqlx(self)
     }
 
@@ -364,7 +456,9 @@ impl MysqlValue for Vec<u8> {
 }
 
 impl MysqlValue for &[u8] {
+    log_value!(bytes);
     fn write(self, writer: &mut MysqlValueWriter) -> MysqlResult<()> {
+        writer.record_value(&self);
         writer.push_sqlx(self)
     }
 
@@ -378,7 +472,9 @@ impl MysqlValue for &[u8] {
 }
 
 impl MysqlValue for NaiveDate {
+    log_value!(quoted);
     fn write(self, writer: &mut MysqlValueWriter) -> MysqlResult<()> {
+        writer.record_value(&self);
         writer.push_sqlx(self)
     }
 
@@ -388,7 +484,9 @@ impl MysqlValue for NaiveDate {
 }
 
 impl MysqlValue for NaiveDateTime {
+    log_value!(quoted);
     fn write(self, writer: &mut MysqlValueWriter) -> MysqlResult<()> {
+        writer.record_value(&self);
         writer.push_sqlx(self)
     }
 
@@ -398,7 +496,9 @@ impl MysqlValue for NaiveDateTime {
 }
 
 impl MysqlValue for NaiveTime {
+    log_value!(quoted);
     fn write(self, writer: &mut MysqlValueWriter) -> MysqlResult<()> {
+        writer.record_value(&self);
         writer.push_sqlx(self)
     }
 
@@ -409,11 +509,16 @@ impl MysqlValue for NaiveTime {
 
 impl MysqlValue for BigDecimal {
     fn write(self, writer: &mut MysqlValueWriter) -> MysqlResult<()> {
+        writer.record_value(&self);
         writer.push_sqlx(self)
     }
 
     fn route_value(&self) -> MysqlRouteValue<'_> {
         MysqlRouteValue::Unsupported("decimal")
+    }
+
+    fn fmt_log_value(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, formatter)
     }
 }
 
@@ -422,11 +527,19 @@ where
     T: Serialize + Send,
 {
     fn write(self, writer: &mut MysqlValueWriter) -> MysqlResult<()> {
+        writer.record_value(&self);
         writer.push_sqlx(sqlx::types::Json(self.0))
     }
 
     fn route_value(&self) -> MysqlRouteValue<'_> {
         MysqlRouteValue::Unsupported("JSON")
+    }
+
+    fn fmt_log_value(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match serde_json::to_string(&self.0) {
+            Ok(value) => formatter.write_str(&value),
+            Err(error) => write!(formatter, "<JSON serialization failed: {error}>"),
+        }
     }
 }
 
@@ -438,6 +551,10 @@ impl MysqlValue for serde_json::Value {
     fn route_value(&self) -> MysqlRouteValue<'_> {
         MysqlRouteValue::Unsupported("JSON")
     }
+
+    fn fmt_log_value(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, formatter)
+    }
 }
 
 impl<T> MysqlValue for Option<T>
@@ -447,7 +564,10 @@ where
     fn write(self, writer: &mut MysqlValueWriter) -> MysqlResult<()> {
         match self {
             Some(value) => value.write(writer),
-            None => writer.push_sqlx(Option::<i64>::None),
+            None => {
+                writer.record_value(&Option::<i64>::None);
+                writer.push_sqlx(Option::<i64>::None)
+            }
         }
     }
 
@@ -460,6 +580,13 @@ where
 
     fn encoded_size_hint(&self) -> usize {
         self.as_ref().map_or(0, MysqlValue::encoded_size_hint)
+    }
+
+    fn fmt_log_value(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Some(value) => value.fmt_log_value(formatter),
+            None => formatter.write_str("null"),
+        }
     }
 }
 
@@ -478,6 +605,10 @@ impl MysqlArgs for () {
 
     fn write(self, _writer: &mut MysqlValueWriter) -> MysqlResult<()> {
         Ok(())
+    }
+
+    fn fmt_log_arguments(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("[]")
     }
 }
 
@@ -503,6 +634,10 @@ where
         }
         Ok(())
     }
+
+    fn fmt_log_arguments(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt_log_values(self.iter(), formatter)
+    }
 }
 
 impl<T, const N: usize> MysqlArgs for [T; N]
@@ -527,6 +662,24 @@ where
         }
         Ok(())
     }
+
+    fn fmt_log_arguments(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt_log_values(self.iter(), formatter)
+    }
+}
+
+fn fmt_log_values<'value, T: MysqlValue + 'value>(
+    values: impl Iterator<Item = &'value T>,
+    formatter: &mut fmt::Formatter<'_>,
+) -> fmt::Result {
+    formatter.write_str("[")?;
+    for (index, value) in values.enumerate() {
+        if index > 0 {
+            formatter.write_str(", ")?;
+        }
+        value.fmt_log_value(formatter)?;
+    }
+    formatter.write_str("]")
 }
 
 macro_rules! tuple_args {
@@ -553,6 +706,13 @@ macro_rules! tuple_args {
                 $(self.$index.write(writer)?;)*
                 Ok(())
             }
+
+            fn fmt_log_arguments(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("[")?;
+                self.0.fmt_log_value(formatter)?;
+                $(formatter.write_str(", ")?; self.$index.fmt_log_value(formatter)?;)*
+                formatter.write_str("]")
+            }
         }
     };
 }
@@ -575,10 +735,25 @@ tuple_args!(15; A:0, B:1, C:2, D:3, E:4, F:5, G:6, H:7, I:8, J:9, K:10, L:11, M:
 tuple_args!(16; A:0, B:1, C:2, D:3, E:4, F:5, G:6, H:7, I:8, J:9, K:10, L:11, M:12, N:13, O:14, P:15);
 
 pub(crate) fn encode_arguments<A: MysqlArgs>(arguments: A) -> MysqlResult<SqlxMySqlArguments> {
+    encode_arguments_with_log(arguments, false).0
+}
+
+pub(crate) fn encode_arguments_with_log<A: MysqlArgs>(
+    arguments: A,
+    capture_parameters: bool,
+) -> (MysqlResult<SqlxMySqlArguments>, Option<String>) {
     let mut writer =
         MysqlValueWriter::with_capacity(arguments.len(), arguments.encoded_size_hint());
-    arguments.write(&mut writer)?;
-    Ok(writer.into_inner())
+    writer.parameters = capture_parameters.then(|| "[".to_string());
+    let result = arguments.write(&mut writer);
+    let parameters = writer.parameters.take().map(|mut parameters| {
+        if result.is_err() {
+            parameters.push_str(" <encoding failed>");
+        }
+        parameters.push(']');
+        parameters
+    });
+    (result.map(|()| writer.into_inner()), parameters)
 }
 
 #[cfg(test)]

@@ -28,7 +28,7 @@ fn execute_accepts_dml_and_select_prefixes_with_whitespace_and_mixed_case() {
         "SELECT(?)",
         "SELECT/* inline comment */?",
     ] {
-        let (prepared, _) = prepare_execute_query(sql, (1_i64,), None).unwrap();
+        let (prepared, _) = prepare_execute_query(sql, (1_i64,), None, None).unwrap();
         assert_eq!(prepared, sql);
         #[cfg(feature = "ai-strict")]
         check_transaction_execute(sql).unwrap();
@@ -53,7 +53,7 @@ fn execute_prefix_check_is_optional() {
         "SELECTé",
         "INSERTED INTO tasks VALUES (1)",
     ] {
-        let result = prepare_execute_query(sql, (), None);
+        let result = prepare_execute_query(sql, (), None, None);
         if cfg!(feature = "ai-strict") {
             assert_eq!(
                 result.unwrap_err(),

@@ -1,12 +1,11 @@
 //! Explicit per-statement routing on an existing transaction connection.
 
-use async_stream::stream;
 use futures_core::Stream;
 use futures_util::{StreamExt, pin_mut};
 
 use crate::{
     FromMysqlRow, MysqlArgs, MysqlExecution, MysqlNestedTransaction, MysqlResult, MysqlTransaction,
-    MysqlTransactionService, mysql_service::render_query, query_routing::QueryRouting,
+    MysqlTransactionService, query_routing::QueryRouting,
 };
 
 /// A borrowed query view; it never starts, commits, or moves the transaction.
@@ -69,8 +68,9 @@ impl MysqlTransaction for RoutedMysqlTransaction<'_> {
         S: AsRef<str> + Send,
         A: MysqlArgs + Send,
     {
-        let sql = render_query(sql.as_ref(), &arguments, self.routing.as_ref())?;
-        self.transaction.execute(sql, arguments).await
+        self.transaction
+            .execute_with_route(sql, arguments, self.routing.as_ref())
+            .await
     }
 
     async fn fetch_optional<S, A, T>(&mut self, sql: S, arguments: A) -> MysqlResult<Option<T>>
@@ -79,8 +79,9 @@ impl MysqlTransaction for RoutedMysqlTransaction<'_> {
         A: MysqlArgs + Send,
         T: FromMysqlRow + Send,
     {
-        let sql = render_query(sql.as_ref(), &arguments, self.routing.as_ref())?;
-        self.transaction.fetch_optional(sql, arguments).await
+        self.transaction
+            .fetch_optional_with_route(sql, arguments, self.routing.as_ref())
+            .await
     }
 
     async fn fetch_one<S, A, T>(&mut self, sql: S, arguments: A) -> MysqlResult<T>
@@ -89,8 +90,9 @@ impl MysqlTransaction for RoutedMysqlTransaction<'_> {
         A: MysqlArgs + Send,
         T: FromMysqlRow + Send,
     {
-        let sql = render_query(sql.as_ref(), &arguments, self.routing.as_ref())?;
-        self.transaction.fetch_one(sql, arguments).await
+        self.transaction
+            .fetch_one_with_route(sql, arguments, self.routing.as_ref())
+            .await
     }
 
     fn fetch<'transaction, S, A, T>(
@@ -103,15 +105,8 @@ impl MysqlTransaction for RoutedMysqlTransaction<'_> {
         A: MysqlArgs + Send + 'transaction,
         T: FromMysqlRow + Send + 'transaction,
     {
-        stream! {
-            let sql = match render_query(sql.as_ref(), &arguments, self.routing.as_ref()) {
-                Ok(sql) => sql,
-                Err(error) => { yield Err(error); return; }
-            };
-            let rows = self.transaction.fetch(sql, arguments);
-            pin_mut!(rows);
-            while let Some(row) = rows.next().await { yield row; }
-        }
+        self.transaction
+            .fetch_with_route(sql, arguments, self.routing.clone(), "fetch")
     }
 
     async fn fetch_all<S, A, T>(&mut self, sql: S, arguments: A) -> MysqlResult<Vec<T>>
@@ -120,7 +115,9 @@ impl MysqlTransaction for RoutedMysqlTransaction<'_> {
         A: MysqlArgs + Send,
         T: FromMysqlRow + Send,
     {
-        let rows = self.fetch(sql, arguments);
+        let rows =
+            self.transaction
+                .fetch_with_route(sql, arguments, self.routing.clone(), "fetch_all");
         pin_mut!(rows);
         let mut values = Vec::new();
         while let Some(row) = rows.next().await {
