@@ -8,7 +8,7 @@ fn literal_check_is_optional_and_does_not_parse_sql() {
         "SELECT 'for update'",
         "SELECT 1 /* FOR UPDATE */",
     ] {
-        let result = prepare_fetch_query(sql, (), None);
+        let result = prepare_fetch_query(sql, (), None, None);
         if cfg!(feature = "ai-strict") {
             assert!(
                 matches!(result, Err(MysqlError::InvalidQuery { .. })),
@@ -17,7 +17,7 @@ fn literal_check_is_optional_and_does_not_parse_sql() {
         } else {
             assert!(result.is_ok(), "{sql}");
         }
-        assert!(prepare_query(sql, (), None).is_ok());
+        assert!(prepare_query(sql, (), None, None).is_ok());
     }
     for sql in [
         "SELECT 1",
@@ -25,7 +25,7 @@ fn literal_check_is_optional_and_does_not_parse_sql() {
         "SELECT 1 FOR\nUPDATE",
         "UPDATE tasks SET id = 1",
     ] {
-        assert!(prepare_fetch_query(sql, (), None).is_ok(), "{sql}");
+        assert!(prepare_fetch_query(sql, (), None, None).is_ok(), "{sql}");
     }
 }
 

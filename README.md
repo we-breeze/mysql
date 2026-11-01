@@ -83,7 +83,29 @@ specifies `statement-cache-capacity`. This bounds retained server-side statement
 when dynamic SQL and routed tables produce many distinct queries; repeated
 queries pay the cost of preparing the statement again.
 
-## Metrics and slow queries
+## Statement errors, metrics and slow queries
+
+`execute`, `fetch`, `fetch_one`, `fetch_optional`, and `fetch_all` emit `ERROR`
+events to `breeze.mysql` when they return or yield an error, regardless of
+duration and without enabling a Cargo feature. Events contain `operation`,
+`elapsed_ms`, the error message, database code/SQLSTATE when available, original
+SQL (at most 4 KiB, truncated on a UTF-8 boundary), and bound parameter values.
+`sql_truncated` indicates truncation. SQL remains parameterized; values appear
+in the separate `parameters` field, including JSON and hexadecimal byte values.
+This also covers transaction statements and routed views, retaining the original
+SQL template. `fetch_all` and routed handles do not add duplicate error events.
+Missing optional rows and dropped/unpolled streams are not execution errors.
+Outer transaction callbacks, BEGIN/COMMIT/ROLLBACK and connection setup do not
+add error logs in this scope. Applications must install a tracing subscriber.
+
+Parameter values are collected while encoding, only when the `breeze.mysql`
+ERROR target is enabled. Custom values and containers forwarding to
+`MysqlValueWriter` automatically record their underlying bound values without
+requiring Debug or Clone. For failures before encoding (such as invalid routing),
+custom values can override `fmt_log_value` and custom containers can override
+`fmt_log_arguments`; otherwise those rejected parameters use a type description.
+Bound values may include sensitive application data; configure access and
+retention accordingly.
 
 Enable `metrics` to eagerly register `MYSQL` handles with business `name`,
 `endpoint="host:port"` and `access="read"`, `"write"`, or `"other"` (whole transactions).

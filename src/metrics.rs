@@ -1,3 +1,4 @@
+use crate::{MysqlArgs, MysqlError, MysqlResult, error_log::QueryLog};
 use std::time::Instant;
 
 #[cfg(feature = "metrics")]
@@ -58,6 +59,7 @@ pub(crate) struct Observation {
     metric: Option<MetricHandle>,
     started: Instant,
     finished: bool,
+    query_log: Option<QueryLog>,
     #[cfg(feature = "slow-log")]
     detail: Detail,
 }
@@ -69,11 +71,12 @@ enum Detail {
 }
 
 impl Observation {
-    pub(crate) fn query(metric: Option<MetricHandle>, _sql: &str) -> Self {
+    pub(crate) fn query(metric: Option<MetricHandle>, operation: &'static str, _sql: &str) -> Self {
         Self {
             metric,
             started: Instant::now(),
             finished: false,
+            query_log: QueryLog::new(operation, _sql),
             #[cfg(feature = "slow-log")]
             detail: Detail::Query(truncate_detail(_sql.as_bytes())),
         }
@@ -84,6 +87,7 @@ impl Observation {
             metric: Some(metric),
             started: Instant::now(),
             finished: false,
+            query_log: None,
             #[cfg(feature = "slow-log")]
             detail: Detail::Transaction,
         }
@@ -96,6 +100,37 @@ impl Observation {
         }
         self.log_slow(elapsed, success);
         self.finished = true;
+    }
+
+    pub(crate) fn error(&self, error: &MysqlError) {
+        if let Some(log) = &self.query_log {
+            log.error(self.started.elapsed(), error);
+        }
+    }
+
+    pub(crate) fn capture_parameters<A: MysqlArgs>(&mut self, arguments: &A) {
+        if let Some(log) = &mut self.query_log {
+            log.capture_parameters(arguments);
+        }
+    }
+
+    pub(crate) fn encode_arguments<A: MysqlArgs>(
+        &mut self,
+        arguments: A,
+    ) -> MysqlResult<sqlx::mysql::MySqlArguments> {
+        let (result, parameters) =
+            crate::arguments::encode_arguments_with_log(arguments, self.query_log.is_some());
+        if let (Some(log), Some(parameters)) = (&mut self.query_log, parameters) {
+            log.set_parameters(parameters);
+        }
+        result
+    }
+
+    pub(crate) fn finish_result<T>(self, result: &MysqlResult<T>) {
+        if let Err(error) = result {
+            self.error(error);
+        }
+        self.finish(result.is_ok());
     }
 
     #[cfg(feature = "slow-log")]

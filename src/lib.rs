@@ -11,6 +11,7 @@ mod api;
 mod arguments;
 mod binary_column;
 mod column;
+mod error_log;
 mod metrics;
 mod mysql_service;
 mod query_routing;

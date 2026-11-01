@@ -229,14 +229,19 @@ impl MysqlService {
         S: AsRef<str> + Send,
         A: MysqlArgs + Send,
     {
-        let observation = Observation::query(Some(self.metrics.write), sql.as_ref());
+        let mut observation = Observation::query(Some(self.metrics.write), "execute", sql.as_ref());
+        let observed = &mut observation;
         let result = run_with_timeout(self.query_timeout, async move {
-            let (sql, arguments) =
-                prepare_execute_query(sql.as_ref(), arguments, self.routing.as_ref())?;
+            let (sql, arguments) = prepare_execute_query(
+                sql.as_ref(),
+                arguments,
+                self.routing.as_ref(),
+                Some(observed),
+            )?;
             execute_query(&self.master_pool, sql.as_ref(), arguments).await
         })
         .await;
-        observation.finish(result.is_ok());
+        observation.finish_result(&result);
         result
     }
 
@@ -246,10 +251,16 @@ impl MysqlService {
         A: MysqlArgs + Send,
         T: FromMysqlRow + Send,
     {
-        let observation = Observation::query(Some(self.metrics.read), sql.as_ref());
+        let mut observation =
+            Observation::query(Some(self.metrics.read), "fetch_optional", sql.as_ref());
+        let observed = &mut observation;
         let result = run_with_timeout(self.query_timeout, async move {
-            let (sql, arguments) =
-                prepare_fetch_query(sql.as_ref(), arguments, self.routing.as_ref())?;
+            let (sql, arguments) = prepare_fetch_query(
+                sql.as_ref(),
+                arguments,
+                self.routing.as_ref(),
+                Some(observed),
+            )?;
             sqlx::query_with::<MySql, _>(sql.as_ref(), arguments)
                 .fetch_optional(self.read_pool())
                 .await
@@ -258,7 +269,7 @@ impl MysqlService {
                 .transpose()
         })
         .await;
-        observation.finish(result.is_ok());
+        observation.finish_result(&result);
         result
     }
 
@@ -268,10 +279,16 @@ impl MysqlService {
         A: MysqlArgs + Send,
         T: FromMysqlRow + Send,
     {
-        let observation = Observation::query(Some(self.metrics.read), sql.as_ref());
+        let mut observation =
+            Observation::query(Some(self.metrics.read), "fetch_one", sql.as_ref());
+        let observed = &mut observation;
         let result = run_with_timeout(self.query_timeout, async move {
-            let (sql, arguments) =
-                prepare_fetch_query(sql.as_ref(), arguments, self.routing.as_ref())?;
+            let (sql, arguments) = prepare_fetch_query(
+                sql.as_ref(),
+                arguments,
+                self.routing.as_ref(),
+                Some(observed),
+            )?;
             sqlx::query_with::<MySql, _>(sql.as_ref(), arguments)
                 .fetch_optional(self.read_pool())
                 .await
@@ -281,7 +298,7 @@ impl MysqlService {
                 .ok_or(MysqlError::RowNotFound)
         })
         .await;
-        observation.finish(result.is_ok());
+        observation.finish_result(&result);
         result
     }
 
@@ -296,17 +313,33 @@ impl MysqlService {
         A: MysqlArgs + Send + 'service,
         T: FromMysqlRow + Send + 'service,
     {
+        self.fetch_with_operation(sql, arguments, "fetch")
+    }
+
+    fn fetch_with_operation<'service, S, A, T>(
+        &'service self,
+        sql: S,
+        arguments: A,
+        operation: &'static str,
+    ) -> impl Stream<Item = MysqlResult<T>> + Send + 'service
+    where
+        S: AsRef<str> + Send + 'service,
+        A: MysqlArgs + Send + 'service,
+        T: FromMysqlRow + Send + 'service,
+    {
         stream! {
-            let observation = Observation::query(Some(self.metrics.read), sql.as_ref());
+            let mut observation = Observation::query(Some(self.metrics.read), operation, sql.as_ref());
             let deadline = tokio::time::Instant::now() + self.query_timeout;
             let mut success = true;
             let (sql, arguments) = match prepare_fetch_query(
                 sql.as_ref(),
                 arguments,
                 self.routing.as_ref(),
+                Some(&mut observation),
             ) {
                 Ok(prepared) => prepared,
                 Err(error) => {
+                    observation.error(&error);
                     yield Err(error);
                     return;
                 }
@@ -318,10 +351,14 @@ impl MysqlService {
                     Ok(Some(row)) => {
                         let result = row.map_err(map_sqlx_error).and_then(decode_row);
                         success &= result.is_ok();
+                        if let Err(error) = &result {
+                            observation.error(error);
+                        }
                         yield result;
                     }
                     Ok(None) => break,
                     Err(_) => {
+                        observation.error(&MysqlError::QueryTimedOut);
                         observation.finish(false);
                         yield Err(MysqlError::QueryTimedOut);
                         return;
@@ -338,7 +375,7 @@ impl MysqlService {
         A: MysqlArgs + Send,
         T: FromMysqlRow + Send,
     {
-        let rows = self.fetch(sql, arguments);
+        let rows = self.fetch_with_operation(sql, arguments, "fetch_all");
         pin_mut!(rows);
         let mut values = Vec::new();
         while let Some(row) = rows.next().await {
@@ -530,32 +567,42 @@ fn prepare_execute_query<'sql, A>(
     sql: &'sql str,
     arguments: A,
     route: Option<&QueryRouting>,
+    observation: Option<&mut Observation>,
 ) -> MysqlResult<(Cow<'sql, str>, sqlx::mysql::MySqlArguments)>
 where
     A: MysqlArgs,
 {
     #[cfg(feature = "ai-strict")]
     {
-        check_execute_autocommit(sql)?;
-        if execute_keyword(sql).eq_ignore_ascii_case("commit") {
-            return Err(crate::routing::invalid(
-                "MySQL uses autocommit by default; a separate COMMIT is not needed. Use with_transaction for explicit transactions",
-            ));
+        let check = (|| {
+            check_execute_autocommit(sql)?;
+            if execute_keyword(sql).eq_ignore_ascii_case("commit") {
+                return Err(crate::routing::invalid(
+                    "MySQL uses autocommit by default; a separate COMMIT is not needed. Use with_transaction for explicit transactions",
+                ));
+            }
+            check_execute_statement(sql)
+        })();
+        if let Err(error) = check {
+            if let Some(observation) = observation {
+                observation.capture_parameters(&arguments);
+            }
+            return Err(error);
         }
-        check_execute_statement(sql)?;
     }
-    prepare_query(sql, arguments, route)
+    prepare_query(sql, arguments, route, observation)
 }
 
 fn prepare_fetch_query<'sql, A>(
     sql: &'sql str,
     arguments: A,
     route: Option<&QueryRouting>,
+    observation: Option<&mut Observation>,
 ) -> MysqlResult<(Cow<'sql, str>, sqlx::mysql::MySqlArguments)>
 where
     A: MysqlArgs,
 {
-    let (sql, arguments) = prepare_query(sql, arguments, route)?;
+    let (sql, arguments) = prepare_query(sql, arguments, route, observation)?;
     #[cfg(feature = "ai-strict")]
     if sql.contains("for update") || sql.contains("FOR UPDATE") {
         return Err(crate::routing::invalid(
@@ -569,12 +616,24 @@ pub(crate) fn prepare_query<'sql, A>(
     sql: &'sql str,
     arguments: A,
     route: Option<&QueryRouting>,
+    observation: Option<&mut Observation>,
 ) -> MysqlResult<(Cow<'sql, str>, sqlx::mysql::MySqlArguments)>
 where
     A: MysqlArgs,
 {
-    let rendered = render_query(sql, &arguments, route)?;
-    let encoded = encode_arguments(arguments)?;
+    let rendered = match render_query(sql, &arguments, route) {
+        Ok(rendered) => rendered,
+        Err(error) => {
+            if let Some(observation) = observation {
+                observation.capture_parameters(&arguments);
+            }
+            return Err(error);
+        }
+    };
+    let encoded = match observation {
+        Some(observation) => observation.encode_arguments(arguments)?,
+        None => encode_arguments(arguments)?,
+    };
     Ok((rendered, encoded))
 }
 
