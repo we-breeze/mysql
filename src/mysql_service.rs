@@ -806,6 +806,19 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn acquisition_ping_is_disabled_by_default_and_can_be_enabled() {
+        let options = MysqlServiceOptions::default();
+        assert!(!options.test_before_acquire);
+        let (_, pool) = build_options("mysql://localhost/wegent", &options).unwrap();
+        assert!(!pool.get_test_before_acquire());
+
+        let options = options.with_test_before_acquire(true);
+        assert!(options.test_before_acquire);
+        let (_, pool) = build_options("mysql://localhost/wegent", &options).unwrap();
+        assert!(pool.get_test_before_acquire());
+    }
+
     fn options() -> MysqlServiceOptions {
         MysqlServiceOptions {
             max_connections: 4,

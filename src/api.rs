@@ -101,6 +101,7 @@ pub struct MysqlServiceOptions {
     pub idle_timeout: Option<Duration>,
     pub max_lifetime: Option<Duration>,
     pub slow_acquire_threshold: Duration,
+    /// Ping idle connections before acquisition. Disabled by default.
     pub test_before_acquire: bool,
     pub charset: String,
     pub timezone: Option<String>,
@@ -116,7 +117,7 @@ impl Default for MysqlServiceOptions {
             idle_timeout: Some(Duration::from_secs(10 * 60)),
             max_lifetime: Some(Duration::from_secs(60 * 60)),
             slow_acquire_threshold: Duration::from_secs(2),
-            test_before_acquire: true,
+            test_before_acquire: false,
             charset: "utf8mb4".to_string(),
             timezone: None,
         }
