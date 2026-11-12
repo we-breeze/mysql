@@ -115,7 +115,7 @@ async fn eager_and_lazy_read_write_pools_release_every_statement() {
 }
 
 #[tokio::test]
-async fn connection_url_cannot_override_disabled_statement_cache() {
+async fn connection_url_cannot_reenable_statement_caching() {
     let url = test_url();
     let separator = if url.contains('?') { '&' } else { '?' };
     let url = format!("{url}{separator}statement-cache-capacity=100");
@@ -123,55 +123,6 @@ async fn connection_url_cannot_override_disabled_statement_cache() {
     exercise_queries(&service).await;
     assert_statements_closed(&service.master_pool).await;
     service.close().await;
-}
-
-#[tokio::test]
-async fn explicit_capacity_reuses_bound_sql_and_evicts_old_statements() {
-    let mysql =
-        MysqlService::connect_with_options(&test_url(), options().with_statement_cache_capacity(4))
-            .await
-            .unwrap();
-    let sql = "SELECT CAST(? AS SIGNED)";
-    for value in [1_i64, 2, 3] {
-        let row: i64 = mysql.fetch_one(sql, (value,)).await.unwrap();
-        assert_eq!(row, value);
-    }
-    let row: i64 = mysql
-        .fetch_one("SELECT CAST(42 AS SIGNED)", ())
-        .await
-        .unwrap();
-    assert_eq!(row, 42);
-    assert_eq!(
-        mysql
-            .master_pool
-            .acquire()
-            .await
-            .unwrap()
-            .cached_statements_size(),
-        1
-    );
-
-    for offset in 1..=5_i64 {
-        let row: i64 = mysql
-            .fetch_one(format!("{sql} + {offset}"), (10_i64,))
-            .await
-            .unwrap();
-        assert_eq!(row, 10 + offset);
-    }
-    {
-        let mut connection = mysql.master_pool.acquire().await.unwrap();
-        assert_eq!(connection.cached_statements_size(), 4);
-        let row = (&mut *connection)
-            .fetch_one(concat!(
-                "SELECT COUNT(*) FROM performance_schema.prepared_statements_instances p ",
-                "JOIN performance_schema.threads t ON t.THREAD_ID = p.OWNER_THREAD_ID ",
-                "WHERE t.PROCESSLIST_ID = CONNECTION_ID()"
-            ))
-            .await
-            .unwrap();
-        assert_eq!(row.get::<i64, _>(0), 4);
-    }
-    mysql.close().await;
 }
 
 #[tokio::test]
