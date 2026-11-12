@@ -20,6 +20,7 @@ fn options() -> MysqlServiceOptions {
         max_lifetime: Some(Duration::from_secs(300)),
         slow_acquire_threshold: Duration::from_millis(500),
         test_before_acquire: true,
+        statement_cache_capacity: 0,
         charset: "utf8mb4".to_string(),
         timezone: Some("+08:00".to_string()),
     }

@@ -324,11 +324,15 @@ fn render_identifier<'sql>(
     Ok(())
 }
 
-fn skip_string(sql: &[u8], mut index: usize) -> usize {
+fn skip_string(sql: &[u8], index: usize) -> usize {
+    skip_quoted(sql, index, true)
+}
+
+fn skip_quoted(sql: &[u8], mut index: usize, backslash_escapes: bool) -> usize {
     let quote = sql[index];
     index += 1;
     while index < sql.len() {
-        if sql[index] == b'\\' {
+        if backslash_escapes && sql[index] == b'\\' {
             index = (index + 2).min(sql.len());
         } else if sql[index] == quote {
             index += 1;
@@ -350,6 +354,57 @@ fn skip_line(sql: &[u8], mut index: usize) -> usize {
     }
     index
 }
+
+/// The text protocol allows statement batches. Leave possible batches and
+/// unbound placeholders to the prepared path so MySQL rejects them as before.
+pub(crate) fn can_fetch_as_text(sql: &str) -> bool {
+    let sql = sql.as_bytes();
+    if !sql.iter().any(|byte| matches!(byte, b';' | b'?')) {
+        return true;
+    }
+    is_single_unbound_statement(sql, true)
+        && (!sql.contains(&b'\\') || is_single_unbound_statement(sql, false))
+}
+
+fn is_single_unbound_statement(sql: &[u8], backslash_escapes: bool) -> bool {
+    let mut index = 0;
+    let mut ended = false;
+    while index < sql.len() {
+        match sql[index] {
+            byte if byte.is_ascii_whitespace() => index += 1,
+            b'#' => index = skip_line(sql, index + 1),
+            b'-' if sql.get(index + 1) == Some(&b'-')
+                && sql.get(index + 2).is_some_and(u8::is_ascii_whitespace) =>
+            {
+                index = skip_line(sql, index + 2);
+            }
+            b'/' if sql.get(index + 1) == Some(&b'*') => {
+                let body = &sql[index + 2..];
+                let Some(end) = body.windows(2).position(|pair| pair == b"*/") else {
+                    return false;
+                };
+                if (body.starts_with(b"!") || body.starts_with(b"M!"))
+                    && (ended || body[..end].iter().any(|byte| matches!(byte, b';' | b'?')))
+                {
+                    return false;
+                }
+                index += end + 4;
+            }
+            _ if ended => return false,
+            b';' => {
+                ended = true;
+                index += 1;
+            }
+            b'?' => return false,
+            b'\'' | b'"' | b'`' => {
+                index = skip_quoted(sql, index, backslash_escapes && sql[index] != b'`');
+            }
+            _ => index += 1,
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
