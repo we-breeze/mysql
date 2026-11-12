@@ -6,7 +6,7 @@ use crate::metrics::Observation;
 #[cfg(feature = "ai-strict")]
 use crate::mysql_service::check_transaction_execute;
 use crate::mysql_service::{
-    decode_row, execute_query, map_sqlx_error, prepare_query, run_with_timeout,
+    decode_row, execute_query, fetch_query, map_sqlx_error, prepare_query, run_with_timeout,
 };
 use crate::query_routing::QueryRouting;
 use crate::{
@@ -16,7 +16,7 @@ use crate::{
 use async_stream::stream;
 use futures_core::Stream;
 use futures_util::{StreamExt, pin_mut};
-use sqlx::MySql;
+use sqlx::Executor as _;
 
 /// Scoped transaction value created only by MysqlService::with_transaction.
 pub struct MysqlTransactionService {
@@ -175,8 +175,8 @@ impl MysqlTransactionService {
         let result = run_with_timeout(self.query_timeout, async {
             let (sql, arguments) =
                 prepare_query(sql.as_ref(), arguments, route, Some(&mut observation))?;
-            sqlx::query_with::<MySql, _>(sql.as_ref(), arguments)
-                .fetch_optional(&mut **self.inner()?)
+            self.inner()?
+                .fetch_optional(fetch_query(sql.as_ref(), arguments))
                 .await
                 .map_err(map_sqlx_error)?
                 .map(decode_row)
@@ -202,8 +202,8 @@ impl MysqlTransactionService {
         let result = run_with_timeout(self.query_timeout, async {
             let (sql, arguments) =
                 prepare_query(sql.as_ref(), arguments, route, Some(&mut observation))?;
-            sqlx::query_with::<MySql, _>(sql.as_ref(), arguments)
-                .fetch_optional(&mut **self.inner()?)
+            self.inner()?
+                .fetch_optional(fetch_query(sql.as_ref(), arguments))
                 .await
                 .map_err(map_sqlx_error)?
                 .map(decode_row)
@@ -252,8 +252,7 @@ impl MysqlTransactionService {
                     return;
                 }
             };
-            let rows =
-                sqlx::query_with::<MySql, _>(sql.as_ref(), arguments).fetch(&mut **transaction);
+            let rows = transaction.fetch(fetch_query(sql.as_ref(), arguments));
             pin_mut!(rows);
             loop {
                 match tokio::time::timeout_at(deadline, rows.next()).await {

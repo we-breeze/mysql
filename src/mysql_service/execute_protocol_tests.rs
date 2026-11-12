@@ -1,4 +1,4 @@
-//! Real MySQL regressions for parameterless execution and manual savepoints.
+//! Real MySQL regressions for text and prepared protocols and manual savepoints.
 
 use super::*;
 use sqlx::{Executor, Row};
@@ -78,6 +78,84 @@ async fn parameterized_execute_keeps_prepared_binding() {
         .await
         .unwrap();
     assert_eq!(row.get::<String, _>(0), value);
+    mysql.close().await;
+}
+
+#[tokio::test]
+async fn parameterless_fetches_use_text_protocol_on_pool_and_transaction() {
+    let mysql = setup("brz_fetch_text").await;
+    let before = prepare_count(&mysql).await;
+    let sql = "SELECT CAST(42 AS SIGNED), 'literal ?; value' /* ; ? */;";
+    let expected = (42_i64, "literal ?; value".to_owned());
+
+    assert_eq!(
+        mysql
+            .fetch_one::<_, _, (i64, String)>(sql, ())
+            .await
+            .unwrap(),
+        expected
+    );
+    assert_eq!(
+        mysql
+            .fetch_optional::<_, _, (i64, String)>(sql, Vec::<i64>::new())
+            .await
+            .unwrap(),
+        Some(expected.clone())
+    );
+    assert_eq!(
+        mysql
+            .fetch_all::<_, _, (i64, String)>(sql, ())
+            .await
+            .unwrap()
+            .as_slice(),
+        std::slice::from_ref(&expected)
+    );
+    mysql
+        .with_transaction(async |tx| {
+            assert_eq!(
+                tx.fetch_one::<_, _, (i64, String)>(sql, ()).await?,
+                expected
+            );
+            assert_eq!(
+                tx.fetch_optional::<_, _, (i64, String)>(sql, ()).await?,
+                Some(expected.clone())
+            );
+            assert_eq!(
+                tx.fetch_all::<_, _, (i64, String)>(sql, ())
+                    .await?
+                    .as_slice(),
+                std::slice::from_ref(&expected)
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(prepare_count(&mysql).await, before);
+
+    let bound: String = mysql
+        .fetch_one("SELECT ?", ("literal ?; value",))
+        .await
+        .unwrap();
+    assert_eq!(bound, expected.1);
+    assert_eq!(prepare_count(&mysql).await, before + 1);
+    mysql.close().await;
+}
+
+#[tokio::test]
+async fn parameterless_fetch_does_not_execute_a_statement_batch() {
+    let mysql = setup("brz_fetch_batch").await;
+    let result: MysqlResult<i64> = mysql
+        .fetch_one(
+            "SELECT CAST(1 AS SIGNED); INSERT INTO brz_fetch_batch (id) VALUES (1)",
+            (),
+        )
+        .await;
+    assert!(matches!(result, Err(MysqlError::Database { .. })));
+    let count: i64 = mysql
+        .fetch_one("SELECT COUNT(*) FROM brz_fetch_batch", ())
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
     mysql.close().await;
 }
 

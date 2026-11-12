@@ -7,8 +7,8 @@ use async_stream::stream;
 use futures_core::Stream;
 use futures_util::{StreamExt, pin_mut};
 use sqlx::{
-    Arguments as _, MySql, MySqlPool,
-    mysql::{MySqlConnectOptions, MySqlPoolOptions},
+    Arguments as _, Executor as _, MySql, MySqlPool,
+    mysql::{MySqlArguments, MySqlConnectOptions, MySqlPoolOptions},
 };
 
 #[cfg(test)]
@@ -18,7 +18,9 @@ use crate::metrics::{MysqlMetrics, Observation};
 use crate::{
     FromMysqlRow, Mysql, MysqlArgs, MysqlError, MysqlExecution, MysqlResult, MysqlRouteKey,
     MysqlRouting, MysqlRow, MysqlServiceOptions, MysqlTransactionService,
-    arguments::encode_arguments, query_routing::QueryRouting, routing::render_sql,
+    arguments::encode_arguments,
+    query_routing::QueryRouting,
+    routing::{can_fetch_as_text, render_sql},
 };
 
 /// SQLx-backed MySQL service with optional per-handle table routing.
@@ -261,8 +263,8 @@ impl MysqlService {
                 self.routing.as_ref(),
                 Some(observed),
             )?;
-            sqlx::query_with::<MySql, _>(sql.as_ref(), arguments)
-                .fetch_optional(self.read_pool())
+            self.read_pool()
+                .fetch_optional(fetch_query(sql.as_ref(), arguments))
                 .await
                 .map_err(map_sqlx_error)?
                 .map(decode_row)
@@ -289,8 +291,8 @@ impl MysqlService {
                 self.routing.as_ref(),
                 Some(observed),
             )?;
-            sqlx::query_with::<MySql, _>(sql.as_ref(), arguments)
-                .fetch_optional(self.read_pool())
+            self.read_pool()
+                .fetch_optional(fetch_query(sql.as_ref(), arguments))
                 .await
                 .map_err(map_sqlx_error)?
                 .map(decode_row)
@@ -344,7 +346,7 @@ impl MysqlService {
                     return;
                 }
             };
-            let rows = sqlx::query_with::<MySql, _>(sql.as_ref(), arguments).fetch(self.read_pool());
+            let rows = self.read_pool().fetch(fetch_query(sql.as_ref(), arguments));
             pin_mut!(rows);
             loop {
                 match tokio::time::timeout_at(deadline, rows.next()).await {
@@ -745,6 +747,13 @@ fn mysql_metrics(
         let _ = (master, slave, name);
         MysqlMetrics::new(None, "", "")
     }
+}
+
+/// SQLx interprets absent arguments as COM_QUERY and present arguments as
+/// prepared execution, even when the argument list is empty.
+pub(crate) fn fetch_query(sql: &str, arguments: MySqlArguments) -> (&str, Option<MySqlArguments>) {
+    let use_text = arguments.len() == 0 && can_fetch_as_text(sql);
+    (sql, (!use_text).then_some(arguments))
 }
 
 /// Parameterless execution uses COM_QUERY: MySQL cannot prepare commands such
