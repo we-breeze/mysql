@@ -103,6 +103,8 @@ pub struct MysqlServiceOptions {
     pub slow_acquire_threshold: Duration,
     /// Ping idle connections before acquisition. Disabled by default.
     pub test_before_acquire: bool,
+    /// Maximum cached prepared statements per connection. Zero disables caching.
+    pub statement_cache_capacity: usize,
     pub charset: String,
     pub timezone: Option<String>,
 }
@@ -118,6 +120,7 @@ impl Default for MysqlServiceOptions {
             max_lifetime: Some(Duration::from_secs(60 * 60)),
             slow_acquire_threshold: Duration::from_secs(2),
             test_before_acquire: false,
+            statement_cache_capacity: 0,
             charset: "utf8mb4".to_string(),
             timezone: None,
         }
@@ -164,6 +167,12 @@ impl MysqlServiceOptions {
     #[must_use]
     pub fn with_test_before_acquire(mut self, value: bool) -> Self {
         self.test_before_acquire = value;
+        self
+    }
+
+    #[must_use]
+    pub fn with_statement_cache_capacity(mut self, value: usize) -> Self {
+        self.statement_cache_capacity = value;
         self
     }
 
