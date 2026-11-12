@@ -75,14 +75,11 @@ let mysql = MysqlService::connect_lazy_read_write_with_options(
 The default pool bounds are zero minimum connections and 32 maximum
 connections per configured pool.
 
-Prepared statement caching defaults to zero. Set
-`MysqlServiceOptions::default().with_statement_cache_capacity(4)` to retain up to
-four prepared statements per physical connection. This option overrides the
-connection URL's `statement-cache-capacity`. Budget the configured capacity
-across all connections and pools that reach the same MySQL instance against
-its `max_prepared_stmt_count`, with room for other clients and in-flight prepares.
-Parameterized statements reuse entries on the same connection when their SQL
-text matches. Parameterless fetches use the text protocol for single statements.
+Parameterless single-statement reads use the text protocol. Statements with
+bound parameters use the prepared protocol and close their statement after
+execution. This applies to pooled, streaming, and transactional reads.
+Statement caching stays disabled even if the connection URL specifies
+`statement-cache-capacity`.
 
 ## Statement errors, metrics and slow queries
 
