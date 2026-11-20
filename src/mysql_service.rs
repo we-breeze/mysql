@@ -226,6 +226,8 @@ impl MysqlService {
         }
     }
 
+    /// Execute SQL directly using the text protocol when there are no bound
+    /// parameters. SQL with bound parameters uses the prepared-statement protocol.
     pub async fn execute<S, A>(&self, sql: S, arguments: A) -> MysqlResult<MysqlExecution>
     where
         S: AsRef<str> + Send,
@@ -247,6 +249,11 @@ impl MysqlService {
         result
     }
 
+    /// Fetch the first row, if any.
+    ///
+    /// A single statement with no bound parameters or placeholders is sent
+    /// directly using the text protocol. SQL with bound parameters uses the
+    /// prepared-statement protocol.
     pub async fn fetch_optional<S, A, T>(&self, sql: S, arguments: A) -> MysqlResult<Option<T>>
     where
         S: AsRef<str> + Send,
@@ -275,6 +282,11 @@ impl MysqlService {
         result
     }
 
+    /// Fetch the first row or return [`MysqlError::RowNotFound`].
+    ///
+    /// A single statement with no bound parameters or placeholders is sent
+    /// directly using the text protocol. SQL with bound parameters uses the
+    /// prepared-statement protocol.
     pub async fn fetch_one<S, A, T>(&self, sql: S, arguments: A) -> MysqlResult<T>
     where
         S: AsRef<str> + Send,
@@ -305,6 +317,10 @@ impl MysqlService {
     }
 
     /// Lazily fetches and decodes rows with driver-level backpressure.
+    ///
+    /// A single statement with no bound parameters or placeholders is sent
+    /// directly using the text protocol. SQL with bound parameters uses the
+    /// prepared-statement protocol.
     pub fn fetch<'service, S, A, T>(
         &'service self,
         sql: S,
@@ -371,6 +387,11 @@ impl MysqlService {
         }
     }
 
+    /// Collect all rows into a vector.
+    ///
+    /// A single statement with no bound parameters or placeholders is sent
+    /// directly using the text protocol. SQL with bound parameters uses the
+    /// prepared-statement protocol.
     pub async fn fetch_all<S, A, T>(&self, sql: S, arguments: A) -> MysqlResult<Vec<T>>
     where
         S: AsRef<str> + Send,
