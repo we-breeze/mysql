@@ -196,8 +196,8 @@ pub trait Mysql: Send + Sync {
     /// this is a no-op, as on `MysqlService`.
     fn route<K: MysqlRouteKey>(&self, key: K) -> Self;
 
-    /// Execute SQL using the text protocol when there are no bound arguments;
-    /// statements with arguments use the prepared-statement protocol.
+    /// Execute SQL directly using the text protocol when there are no bound
+    /// parameters. SQL with bound parameters uses the prepared-statement protocol.
     fn execute<S, A>(
         &self,
         sql: S,
@@ -207,6 +207,11 @@ pub trait Mysql: Send + Sync {
         S: AsRef<str> + Send,
         A: MysqlArgs + Send;
 
+    /// Fetch the first row, if any.
+    ///
+    /// A single statement with no bound parameters or placeholders is sent
+    /// directly using the text protocol. SQL with bound parameters uses the
+    /// prepared-statement protocol.
     fn fetch_optional<S, A, T>(
         &self,
         sql: S,
@@ -217,6 +222,11 @@ pub trait Mysql: Send + Sync {
         A: MysqlArgs + Send,
         T: FromMysqlRow + Send;
 
+    /// Fetch the first row or return [`MysqlError::RowNotFound`].
+    ///
+    /// A single statement with no bound parameters or placeholders is sent
+    /// directly using the text protocol. SQL with bound parameters uses the
+    /// prepared-statement protocol.
     fn fetch_one<S, A, T>(
         &self,
         sql: S,
@@ -227,6 +237,11 @@ pub trait Mysql: Send + Sync {
         A: MysqlArgs + Send,
         T: FromMysqlRow + Send;
 
+    /// Stream rows lazily.
+    ///
+    /// A single statement with no bound parameters or placeholders is sent
+    /// directly using the text protocol. SQL with bound parameters uses the
+    /// prepared-statement protocol.
     fn fetch<'service, S, A, T>(
         &'service self,
         sql: S,
@@ -237,6 +252,11 @@ pub trait Mysql: Send + Sync {
         A: MysqlArgs + Send + 'service,
         T: FromMysqlRow + Send + 'service;
 
+    /// Collect all rows into a vector.
+    ///
+    /// A single statement with no bound parameters or placeholders is sent
+    /// directly using the text protocol. SQL with bound parameters uses the
+    /// prepared-statement protocol.
     fn fetch_all<S, A, T>(
         &self,
         sql: S,
@@ -279,7 +299,9 @@ pub trait Mysql: Send + Sync {
 /// Scoped query operations available inside Mysql::with_transaction.
 #[allow(async_fn_in_trait)]
 pub trait MysqlTransaction: Send {
-    /// Uses the same protocol selection as [`Mysql::execute`] on this connection.
+    /// Execute SQL directly using the text protocol when there are no bound
+    /// parameters. SQL with bound parameters uses the prepared-statement protocol.
+    ///
     /// With `ai-strict`, accepts only INSERT, UPDATE, DELETE, REPLACE, or SELECT.
     /// Use [`MysqlNestedTransaction::with_transaction`] for nested SAVEPOINT scopes;
     /// return Ok/Err from the callback to complete the current scope.
@@ -288,18 +310,33 @@ pub trait MysqlTransaction: Send {
         S: AsRef<str> + Send,
         A: MysqlArgs + Send;
 
+    /// Fetch the first row, if any.
+    ///
+    /// A single statement with no bound parameters or placeholders is sent
+    /// directly using the text protocol. SQL with bound parameters uses the
+    /// prepared-statement protocol.
     async fn fetch_optional<S, A, T>(&mut self, sql: S, arguments: A) -> MysqlResult<Option<T>>
     where
         S: AsRef<str> + Send,
         A: MysqlArgs + Send,
         T: FromMysqlRow + Send;
 
+    /// Fetch the first row or return [`MysqlError::RowNotFound`].
+    ///
+    /// A single statement with no bound parameters or placeholders is sent
+    /// directly using the text protocol. SQL with bound parameters uses the
+    /// prepared-statement protocol.
     async fn fetch_one<S, A, T>(&mut self, sql: S, arguments: A) -> MysqlResult<T>
     where
         S: AsRef<str> + Send,
         A: MysqlArgs + Send,
         T: FromMysqlRow + Send;
 
+    /// Stream rows lazily.
+    ///
+    /// A single statement with no bound parameters or placeholders is sent
+    /// directly using the text protocol. SQL with bound parameters uses the
+    /// prepared-statement protocol.
     fn fetch<'transaction, S, A, T>(
         &'transaction mut self,
         sql: S,
@@ -310,6 +347,11 @@ pub trait MysqlTransaction: Send {
         A: MysqlArgs + Send + 'transaction,
         T: FromMysqlRow + Send + 'transaction;
 
+    /// Collect all rows into a vector.
+    ///
+    /// A single statement with no bound parameters or placeholders is sent
+    /// directly using the text protocol. SQL with bound parameters uses the
+    /// prepared-statement protocol.
     async fn fetch_all<S, A, T>(&mut self, sql: S, arguments: A) -> MysqlResult<Vec<T>>
     where
         S: AsRef<str> + Send,

@@ -41,6 +41,8 @@ struct Task {
 
 let mysql = MysqlService::connect(database_url).await?;
 
+let task_count: i64 = mysql.fetch_one("SELECT COUNT(*) FROM tasks", ()).await?;
+
 let task: Task = mysql
     .fetch_one(
         "SELECT id, title, config, deleted_at FROM tasks WHERE id = ?",
@@ -75,9 +77,15 @@ let mysql = MysqlService::connect_lazy_read_write_with_options(
 The default pool bounds are zero minimum connections and 32 maximum
 connections per configured pool.
 
-Parameterless single-statement reads use the text protocol. Statements with
-bound parameters use the prepared protocol and close their statement after
-execution. This applies to pooled, streaming, and transactional reads.
+Pass `()` when there are no parameters to bind. `execute` sends SQL without
+bound parameters directly using the MySQL text protocol (`COM_QUERY`). The
+`fetch` methods use the text protocol for single statements without bound
+parameters or placeholders. Possible statement batches and unbound placeholders
+take the prepared path so MySQL can reject them.
+
+With bound parameters, both `execute` and the `fetch` methods use the
+prepared-statement protocol and close the statement after execution. These rules
+apply to pooled and transactional calls, including streaming reads.
 Statement caching stays disabled even if the connection URL specifies
 `statement-cache-capacity`.
 
